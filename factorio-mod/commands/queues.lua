@@ -60,6 +60,9 @@ end
 -- that entry has since been replaced or cleared (move_stop, a new move_to, companion death).
 
 local function cancel_request(q)
+  -- self-heal if init_storage never ran this load (code hot-reloaded without a version bump,
+  -- so on_configuration_changed did not fire and the field was never created)
+  storage.path_requests = storage.path_requests or {}
   if q.request_id then
     storage.path_requests[q.request_id] = nil
     q.request_id = nil
@@ -106,6 +109,7 @@ end
 
 -- Invoked from control.lua's on_script_path_request_finished handler.
 function M.handle_path_result(event)
+  storage.path_requests = storage.path_requests or {}
   local cid = storage.path_requests[event.id]
   if cid == nil then return end -- stale/unknown/already superseded request
   storage.path_requests[event.id] = nil
