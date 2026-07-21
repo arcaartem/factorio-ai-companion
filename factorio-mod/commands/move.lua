@@ -1,5 +1,11 @@
--- AI Companion v0.7.0 - Move commands
+-- AI Companion - Move commands
+-- Movement is driven by LuaSurface::request_path (real pathfinding, not a straight-line
+-- bearing walk). request_path is asynchronous, so these commands only kick off/cancel/poll
+-- the walk; the actual path-following and arrival/stuck detection lives in queues.lua's
+-- tick_walk_queues, which fac_companion_stop_all and fac_companion_disappear (companion.lua)
+-- also rely on via storage.walking_queues.
 local u = require("commands.init")
+local queues = require("commands.queues")
 
 commands.add_command("fac_move_to", nil, function(cmd)
   u.safe_command(function()
@@ -8,8 +14,11 @@ commands.add_command("fac_move_to", nil, function(cmd)
     if not id then u.error_response("Companion not found"); return end
     local x, y = tonumber(args[2]), tonumber(args[3])
     if not x or not y then u.error_response("Invalid coordinates"); return end
-    storage.walking_queues[id] = {target = {x = x, y = y}}
-    u.json_response({id = id, walking_to = {x = x, y = y}})
+    -- Calling this again with the same (x, y) while already requesting/walking is how the
+    -- orchestrator polls arrival status - see queues.start_walk's idempotent check.
+    local result = queues.start_walk(id, {x = x, y = y})
+    result.id = id
+    u.json_response(result)
   end)
 end)
 
@@ -20,17 +29,18 @@ commands.add_command("fac_move_follow", nil, function(cmd)
     if not id then u.error_response("Companion not found"); return end
     local pname = args[2]
     if not game.get_player(pname) then u.error_response("Player not found"); return end
-    storage.walking_queues[id] = {follow_player = pname}
-    u.json_response({id = id, following = pname})
+    local result = queues.start_follow(id, pname)
+    result.id = id
+    u.json_response(result)
   end)
 end)
 
 commands.add_command("fac_move_stop", nil, function(cmd)
   u.safe_command(function()
-    local id, c = u.find_companion(cmd.parameter)
+    local id = u.find_companion(cmd.parameter)
     if not id then u.error_response("Companion not found"); return end
-    storage.walking_queues[id] = nil
-    c.entity.walking_state = {walking = false}
-    u.json_response({id = id, stopped = true})
+    local result = queues.stop_walk(id)
+    result.id = id
+    u.json_response(result)
   end)
 end)

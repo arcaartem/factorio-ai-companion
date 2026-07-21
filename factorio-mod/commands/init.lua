@@ -76,6 +76,34 @@ function M.distance(a, b)
   return math.sqrt((a.x - b.x)^2 + (a.y - b.y)^2)
 end
 
+-- Player-parity reach check. kind selects which of the companion's reach
+-- properties (all read-only on LuaControl, inherited by character LuaEntity)
+-- applies: "resource" for mining, "item" for ground item pickup, anything
+-- else (default) for building/manipulation actions.
+-- Returns nil when pos is in range, or a uniform machine-readable error table
+-- when not, so the orchestrator can walk to `target` and retry.
+function M.check_reach(id, c, pos, kind)
+  local limit
+  if kind == "resource" then
+    limit = c.entity.resource_reach_distance or 10
+  elseif kind == "item" then
+    limit = c.entity.item_pickup_distance or c.entity.reach_distance or 10
+  else
+    limit = c.entity.reach_distance or 10
+  end
+  local dist = M.distance(c.entity.position, pos)
+  if dist > limit then
+    return {
+      id = id,
+      error = "Too far",
+      distance = math.floor(dist + 0.5),
+      reach = math.floor(limit + 0.5),
+      target = {x = pos.x, y = pos.y}
+    }
+  end
+  return nil
+end
+
 function M.get_direction(from, to)
   local dx, dy = to.x - from.x, to.y - from.y
   if math.abs(dx) < 0.5 and math.abs(dy) < 0.5 then return nil end

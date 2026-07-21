@@ -40,7 +40,8 @@ commands.add_command("fac_resource_mine", nil, function(cmd)
     end
     if not x or not y then u.error_response("Invalid coordinates"); return end
     local tpos = {x = x, y = y}
-    if u.distance(c.entity.position, tpos) > 5 then u.json_response({id = id, error = "Too far"}); return end
+    local reach_err = u.check_reach(id, c, tpos, "resource")
+    if reach_err then u.json_response(reach_err); return end
     -- Start realistic mining via queue system (with optional resource filter)
     local result = queues.start_harvest(id, tpos, count, resource_name)
     if result then

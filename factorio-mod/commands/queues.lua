@@ -11,6 +11,14 @@ local ATTACK_COOLDOWN = 15
 local ATTACK_RANGE = 6
 local MINING_RANGE = 5
 
+-- Walk / pathfinding
+local WAYPOINT_DIST = 1.0        -- distance to switch to the next path waypoint
+local ARRIVE_DIST = 1.5          -- distance to consider the final target reached
+local STUCK_MIN_DIST = 0.5       -- minimum net displacement per stuck-check window
+local STUCK_TICKS = 180          -- ~3s of insufficient movement while walking = stuck
+local FOLLOW_REPATH_TICKS = 60   -- minimum ticks between re-path requests while following
+local FOLLOW_REPATH_DIST = 4     -- re-path if the followed player drifted this far from the last path's goal
+
 -- Validate companion exists and is valid
 local function valid_companion(id)
   local c = u.get_companion(id)
@@ -41,6 +49,258 @@ function M.init()
   storage.craft_queues = storage.craft_queues or {}
   storage.build_queues = storage.build_queues or {}
   storage.combat_queues = storage.combat_queues or {}
+end
+
+-- ============ WALK ============
+--
+-- LuaSurface::request_path is asynchronous: it returns a request id immediately, and the
+-- actual path (or failure) is delivered later via on_script_path_request_finished. Pending
+-- requests are tracked in storage.path_requests (request id -> companion id) so the event
+-- handler can find its way back to the right walking_queues entry, including the case where
+-- that entry has since been replaced or cleared (move_stop, a new move_to, companion death).
+
+local function cancel_request(q)
+  if q.request_id then
+    storage.path_requests[q.request_id] = nil
+    q.request_id = nil
+  end
+end
+
+local function request_path(cid, c, goal)
+  local q = storage.walking_queues[cid]
+  if not q then return end
+  cancel_request(q)
+  local proto = c.entity.prototype
+  -- bounding_box must be the prototype's unshifted collision_box (centered at {0,0}), not
+  -- entity.bounding_box (which is shifted to the entity's current position) - a shifted box
+  -- silently produces bogus/failing path requests.
+  local ok, req_id = pcall(function()
+    return c.entity.surface.request_path{
+      bounding_box = proto.collision_box,
+      collision_mask = proto.collision_mask,
+      start = c.entity.position,
+      goal = goal,
+      force = c.entity.force,
+      radius = 1,
+      can_open_gates = true,
+      entity_to_ignore = c.entity,
+      pathfind_flags = {
+        allow_paths_through_own_entities = true,
+        cache = false,
+        prefer_straight_paths = true
+      }
+    }
+  end)
+  if ok and req_id then
+    storage.path_requests[req_id] = cid
+    q.request_id = req_id
+    q.status = "requesting"
+    q.path = nil
+    q.path_index = nil
+    q.path_goal = {x = goal.x, y = goal.y}
+    q.last_path_tick = game.tick
+  else
+    q.status = "no_path"
+  end
+end
+
+-- Invoked from control.lua's on_script_path_request_finished handler.
+function M.handle_path_result(event)
+  local cid = storage.path_requests[event.id]
+  if cid == nil then return end -- stale/unknown/already superseded request
+  storage.path_requests[event.id] = nil
+
+  local q = storage.walking_queues[cid]
+  if not q or q.request_id ~= event.id then return end -- queue replaced/cleared meanwhile
+  q.request_id = nil
+
+  local c = valid_companion(cid)
+  if not c then storage.walking_queues[cid] = nil; return end
+
+  if not event.path or #event.path == 0 then
+    -- try_again_later means the pathfinder was overloaded, not that the goal is unreachable -
+    -- retry a bounded number of times before giving up for real.
+    if event.try_again_later and (q.busy_retries or 0) < 3 then
+      q.busy_retries = (q.busy_retries or 0) + 1
+      request_path(cid, c, q.target)
+    else
+      q.status = "no_path"
+      c.entity.walking_state = {walking = false}
+    end
+    return
+  end
+
+  q.busy_retries = 0
+  q.path = event.path
+  q.path_index = 1
+  q.status = "walking"
+  q.last_position = {x = c.entity.position.x, y = c.entity.position.y}
+  q.stuck_ticks = 0
+  q.stuck_retried = false
+end
+
+function M.start_walk(cid, target)
+  local c = valid_companion(cid)
+  if not c then return {error = "Invalid companion"} end
+
+  local existing = storage.walking_queues[cid]
+  -- Idempotent poll: repeating the same target while already requesting/walking just
+  -- reports current status instead of restarting the pathfind - this is also how the
+  -- orchestrator polls for arrival, by calling move_to again with the same coordinates.
+  if existing and not existing.follow_player and existing.target
+     and u.distance(existing.target, target) < WAYPOINT_DIST
+     and (existing.status == "requesting" or existing.status == "walking") then
+    return M.get_walk_status(cid)
+  end
+  if existing then cancel_request(existing) end
+
+  if u.distance(c.entity.position, target) < ARRIVE_DIST then
+    storage.walking_queues[cid] = nil
+    c.entity.walking_state = {walking = false}
+    return {started = true, active = false, status = "arrived", target = {x = target.x, y = target.y}}
+  end
+
+  storage.walking_queues[cid] = {target = {x = target.x, y = target.y}, status = "requesting", busy_retries = 0}
+  request_path(cid, c, target)
+  local result = M.get_walk_status(cid)
+  result.started = true
+  return result
+end
+
+function M.start_follow(cid, player_name)
+  local c = valid_companion(cid)
+  if not c then return {error = "Invalid companion"} end
+  local player = game.get_player(player_name)
+  if not player or not player.valid then return {error = "Player not found"} end
+
+  local existing = storage.walking_queues[cid]
+  if existing then cancel_request(existing) end
+
+  storage.walking_queues[cid] = {
+    follow_player = player_name,
+    target = {x = player.position.x, y = player.position.y},
+    status = "requesting",
+    busy_retries = 0
+  }
+  request_path(cid, c, player.position)
+  local result = M.get_walk_status(cid)
+  result.started = true
+  return result
+end
+
+function M.stop_walk(cid)
+  local q = storage.walking_queues[cid]
+  if q then cancel_request(q) end
+  storage.walking_queues[cid] = nil
+  local c = valid_companion(cid)
+  if c then c.entity.walking_state = {walking = false} end
+  return {stopped = true}
+end
+
+-- Status: "requesting" | "walking" | "arrived" | "no_path" | "stuck", or active=false/"idle"
+-- when there is no queue at all.
+function M.get_walk_status(cid)
+  local q = storage.walking_queues[cid]
+  if not q then return {active = false, status = "idle"} end
+  local result = {active = true, status = q.status, target = q.target}
+  if q.follow_player then result.following = q.follow_player end
+  local c = valid_companion(cid)
+  if c and q.target then
+    result.distance_remaining = math.floor(u.distance(c.entity.position, q.target) * 10) / 10
+  end
+  return result
+end
+
+function M.tick_walk_queues()
+  process_queue("walking_queues", function(cid, q, c)
+    local e = c.entity
+
+    if q.follow_player then
+      local p = game.get_player(q.follow_player)
+      if not p or not p.valid then
+        cancel_request(q)
+        e.walking_state = {walking = false}
+        return true
+      end
+      q.target = {x = p.position.x, y = p.position.y}
+    end
+
+    if not q.target then return true end
+
+    local dist_to_target = u.distance(e.position, q.target)
+
+    -- Re-checked every tick (not just once) since a follow target can walk back into range.
+    if dist_to_target < ARRIVE_DIST then
+      e.walking_state = {walking = false}
+      q.status = "arrived"
+      cancel_request(q)
+      return not q.follow_player
+    end
+
+    -- "arrived"/"no_path"/"stuck" only resume automatically for a follow target that has
+    -- drifted back out of range; otherwise they sit until an explicit move_to/move_follow.
+    local need_path = (q.status == "arrived" or q.status == "no_path" or q.status == "stuck")
+    if q.follow_player and not need_path then
+      local drifted = not q.path_goal or u.distance(q.path_goal, q.target) > FOLLOW_REPATH_DIST
+      local can_repath = (game.tick - (q.last_path_tick or 0)) >= FOLLOW_REPATH_TICKS
+      need_path = drifted and can_repath
+    end
+
+    if need_path then
+      if q.status == "stuck" or q.status == "no_path" then
+        e.walking_state = {walking = false}
+        return false
+      end
+      request_path(cid, c, q.target)
+      return false
+    end
+
+    if q.status == "requesting" then
+      e.walking_state = {walking = false} -- hold position until the async path arrives
+      return false
+    end
+
+    if q.status ~= "walking" or not q.path or not q.path_index or q.path_index > #q.path then
+      request_path(cid, c, q.target)
+      return false
+    end
+
+    -- Advance through waypoints toward the final target
+    local waypoint = q.path[q.path_index].position
+    if u.distance(e.position, waypoint) < WAYPOINT_DIST then
+      q.path_index = q.path_index + 1
+      waypoint = (q.path_index <= #q.path) and q.path[q.path_index].position or q.target
+    end
+
+    local dir = u.get_direction(e.position, waypoint)
+    if dir then e.walking_state = {walking = true, direction = dir} else e.walking_state = {walking = false} end
+
+    -- Stuck detection: net displacement since the last check, not per-tick movement, so
+    -- brief oscillation against an obstacle still counts as "not making progress".
+    if not q.last_position then q.last_position = {x = e.position.x, y = e.position.y} end
+    if u.distance(e.position, q.last_position) < STUCK_MIN_DIST then
+      q.stuck_ticks = (q.stuck_ticks or 0) + TICK_INTERVAL
+    else
+      q.stuck_ticks = 0
+      q.last_position = {x = e.position.x, y = e.position.y}
+    end
+
+    if q.stuck_ticks >= STUCK_TICKS then
+      q.stuck_ticks = 0
+      q.last_position = {x = e.position.x, y = e.position.y}
+      if not q.stuck_retried then
+        -- First stall: the obstruction (another unit, a closed gate) or the path itself
+        -- might be stale - request a fresh path once before giving up.
+        q.stuck_retried = true
+        request_path(cid, c, q.target)
+      else
+        e.walking_state = {walking = false}
+        q.status = "stuck"
+      end
+    end
+
+    return false
+  end)
 end
 
 -- ============ HARVEST ============

@@ -10,6 +10,7 @@ local function init_storage()
   storage.companions = storage.companions or {}
   storage.companion_next_id = storage.companion_next_id or 1
   storage.walking_queues = storage.walking_queues or {}
+  storage.path_requests = storage.path_requests or {}
   storage.context_clear_requests = storage.context_clear_requests or {}
   storage.errors = storage.errors or {}
   storage.companion_markers = storage.companion_markers or {}
@@ -169,6 +170,12 @@ local function update_companion_markers()
   end
 end
 
+-- Pathfinding results arrive asynchronously (LuaSurface::request_path is non-blocking);
+-- hand them off to the walking queue system that tracks the pending request map.
+script.on_event(defines.events.on_script_path_request_finished, function(event)
+  queues.handle_path_result(event)
+end)
+
 script.on_nth_tick(5, function(ev)
   if ev.tick % 1800 == 0 then cleanup_messages() end
   -- Update map markers every 30 ticks (0.5 sec)
@@ -178,25 +185,5 @@ script.on_nth_tick(5, function(ev)
   queues.tick_craft_queues()
   queues.tick_build_queues()
   queues.tick_combat_queues()
-  -- Process walking queues
-  if not storage.walking_queues then return end
-  for cid, q in pairs(storage.walking_queues) do
-    local c = u.get_companion(cid)
-    if not c then storage.walking_queues[cid] = nil; goto skip end
-    if q.follow_player then
-      local p = game.players[q.follow_player]
-      if p and p.valid then q.target = {x = p.position.x, y = p.position.y}
-      else storage.walking_queues[cid] = nil; goto skip end
-    end
-    if not q.target then storage.walking_queues[cid] = nil; goto skip end
-    local e, dist = c.entity, u.distance(c.entity.position, q.target)
-    if dist < 2 then
-      e.walking_state = {walking = false}
-      if not q.follow_player then storage.walking_queues[cid] = nil end
-    else
-      local dir = u.get_direction(e.position, q.target)
-      if dir then e.walking_state = {walking = true, direction = dir} end
-    end
-    ::skip::
-  end
+  queues.tick_walk_queues()
 end)

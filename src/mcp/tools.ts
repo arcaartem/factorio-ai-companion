@@ -9,7 +9,7 @@ export const SendMessageSchema = z.object({
 export const TOOLS: Record<string, {
   desc: string;
   rcon: string;  // Template with {param} placeholders
-  params: Record<string, { type: "number" | "string"; desc?: string; required?: boolean; default?: any }>;
+  params: Record<string, { type: "number" | "string" | "boolean"; desc?: string; required?: boolean; default?: any }>;
 }> = {
   // Chat
   chat_get: {
@@ -208,7 +208,7 @@ export const TOOLS: Record<string, {
       entityName: { type: "string", required: true },
       x: { type: "number", required: true },
       y: { type: "number", required: true },
-      direction: { type: "number", desc: "Direction 0-7", default: 0 }
+      direction: { type: "number", desc: "Direction 0-3", default: 0 }
     }
   },
   building_place_start: {
@@ -219,7 +219,7 @@ export const TOOLS: Record<string, {
       entityName: { type: "string", required: true },
       x: { type: "number", required: true },
       y: { type: "number", required: true },
-      direction: { type: "number", default: 0 }
+      direction: { type: "number", desc: "Direction 0-3 (N/E/S/W)", default: 0 }
     }
   },
   building_place_status: {
@@ -229,9 +229,10 @@ export const TOOLS: Record<string, {
   },
   building_remove: {
     desc: "Remove a building at coordinates",
-    rcon: "/fac_building_remove {companionId} {x} {y}",
+    rcon: "/fac_building_remove {companionId} {entityName} {x} {y}",
     params: {
       companionId: { type: "number", required: true },
+      entityName: { type: "string", required: true },
       x: { type: "number", required: true },
       y: { type: "number", required: true }
     }
@@ -248,55 +249,59 @@ export const TOOLS: Record<string, {
   },
   building_info: {
     desc: "Get building info at coordinates",
-    rcon: "/fac_building_info {companionId} {x} {y}",
+    rcon: "/fac_building_info {companionId} {entityName} {x} {y}",
     params: {
       companionId: { type: "number", required: true },
+      entityName: { type: "string", required: true },
       x: { type: "number", required: true },
       y: { type: "number", required: true }
     }
   },
   building_rotate: {
     desc: "Rotate a building at coordinates",
-    rcon: "/fac_building_rotate {companionId} {x} {y}",
+    rcon: "/fac_building_rotate {companionId} {x} {y} {direction}",
     params: {
       companionId: { type: "number", required: true },
       x: { type: "number", required: true },
-      y: { type: "number", required: true }
+      y: { type: "number", required: true },
+      direction: { type: "number", desc: "Direction 0-3 (N/E/S/W)", required: true }
     }
   },
   building_recipe: {
     desc: "Get/set recipe for assembling machine",
-    rcon: "/fac_building_recipe {companionId} {x} {y} {recipe}",
+    rcon: "/fac_building_recipe {companionId} {recipe} {x} {y}",
     params: {
       companionId: { type: "number", required: true },
       x: { type: "number", required: true },
       y: { type: "number", required: true },
-      recipe: { type: "string", default: "" }
+      recipe: { type: "string", required: true }
     }
   },
   building_fuel: {
     desc: "Add fuel to entity (burner, furnace, etc)",
-    rcon: "/fac_building_fuel {companionId} {x} {y} {fuelName} {count}",
+    rcon: "/fac_building_fuel {companionId} {fuelName} {count} {x} {y}",
     params: {
       companionId: { type: "number", required: true },
-      x: { type: "number", required: true },
-      y: { type: "number", required: true },
       fuelName: { type: "string", required: true },
-      count: { type: "number", required: true }
+      count: { type: "number", required: true },
+      x: { type: "number", required: false },
+      y: { type: "number", required: false }
     }
   },
   building_empty: {
     desc: "Empty contents from entity",
-    rcon: "/fac_building_empty {companionId} {x} {y}",
+    rcon: "/fac_building_empty {companionId} {itemName} {count} {x} {y}",
     params: {
       companionId: { type: "number", required: true },
-      x: { type: "number", required: true },
-      y: { type: "number", required: true }
+      itemName: { type: "string", required: true },
+      count: { type: "number", desc: "Amount to extract", required: false, default: 10 },
+      x: { type: "number", required: false },
+      y: { type: "number", required: false }
     }
   },
   building_fill: {
     desc: "Fill entity with items",
-    rcon: "/fac_building_fill {companionId} {x} {y} {itemName} {count}",
+    rcon: "/fac_building_fill {companionId} {itemName} {count} {x} {y}",
     params: {
       companionId: { type: "number", required: true },
       x: { type: "number", required: true },
@@ -336,20 +341,18 @@ export const TOOLS: Record<string, {
     params: { companionId: { type: "number", required: true } }
   },
   action_defend: {
-    desc: "Defend current position (attack nearby enemies)",
-    rcon: "/fac_action_defend {companionId} {radius}",
+    desc: "Toggle the companion's auto_defend flag on/off (currently not read anywhere else in the mod - has no observable effect yet)",
+    rcon: "/fac_action_defend {companionId} {enabled}",
     params: {
       companionId: { type: "number", required: true },
-      radius: { type: "number", default: 20 }
+      enabled: { type: "boolean", desc: "true to enable, false to disable", required: true }
     }
   },
   action_flee: {
     desc: "Flee from danger",
-    rcon: "/fac_action_flee {companionId} {x} {y} {distance}",
+    rcon: "/fac_action_flee {companionId} {distance}",
     params: {
       companionId: { type: "number", required: true },
-      x: { type: "number", required: true },
-      y: { type: "number", required: true },
       distance: { type: "number", required: true }
     }
   },
