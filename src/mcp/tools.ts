@@ -62,6 +62,14 @@ export const TOOLS: Record<string, {
     rcon: "/fac_companion_stop_all {companionId}",
     params: { companionId: { type: "number", required: true } }
   },
+  companion_realistic: {
+    desc: "Toggle per-companion reach enforcement (opt-in 'realistic' mode). Default OFF lets the companion act at any range; ON requires being within reach for building/resource actions, like a human player.",
+    rcon: "/fac_companion_realistic {companionId} {enabled}",
+    params: {
+      companionId: { type: "string", desc: "Companion ID or name, or 'all' to apply to every companion", required: true },
+      enabled: { type: "boolean", desc: "true to enforce reach, false to act at any range", required: true }
+    }
+  },
 
   // Movement
   move_to: {

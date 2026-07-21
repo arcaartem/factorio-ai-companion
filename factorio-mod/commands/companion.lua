@@ -11,7 +11,8 @@ commands.add_command("fac_companion_list", nil, function(cmd)
           id = id,
           position = {x = math.floor(pos.x * 10) / 10, y = math.floor(pos.y * 10) / 10},
           health = math.floor(c.entity.health / c.entity.max_health * 100),
-          name = c.name
+          name = c.name,
+          realistic = c.realistic or false
         }
       end
     end
@@ -37,7 +38,7 @@ commands.add_command("fac_companion_spawn", nil, function(cmd)
     if e then
       local color = u.get_companion_color(id)
       e.color = color
-      storage.companions[id] = {entity = e, color = color, label = u.render_label(e, "#" .. id, color), spawned_tick = game.tick}
+      storage.companions[id] = {entity = e, color = color, label = u.render_label(e, "#" .. id, color), spawned_tick = game.tick, realistic = false}
       game.print("[#" .. id .. " spawned]", u.print_color(color))
       u.json_response({spawned = true, id = id})
     else u.error_response("Failed to spawn") end
@@ -172,5 +173,32 @@ commands.add_command("fac_companion_stop_all", nil, function(cmd)
     end
     c.entity.walking_state = {walking = false}
     u.json_response({id = id, stopped = stopped})
+  end)
+end)
+
+-- Toggle per-companion reach enforcement (opt-in "realistic" mode).
+-- Default is off (unrestricted, act at any range); on = human-like, must
+-- be within reach for building/resource actions (see u.check_reach).
+commands.add_command("fac_companion_realistic", nil, function(cmd)
+  u.safe_command(function()
+    local args = u.parse_args("^(%S+)%s+(%S+)$", cmd.parameter)
+    local target, mode_arg = args[1], args[2]
+    if not target or target == "" then u.error_response("Companion not found"); return end
+    local mode = (mode_arg or ""):lower()
+    local on = (mode == "on" or mode == "true" or mode == "1")
+    if target == "all" then
+      local ids = {}
+      for cid, c in pairs(storage.companions) do
+        c.realistic = on
+        ids[#ids + 1] = cid
+      end
+      table.sort(ids)
+      u.json_response({realistic = on, companions = ids})
+    else
+      local id, c = u.find_companion(target)
+      if not id then u.error_response("Companion not found"); return end
+      c.realistic = on
+      u.json_response({id = id, realistic = on})
+    end
   end)
 end)
