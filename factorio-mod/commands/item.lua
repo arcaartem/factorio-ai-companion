@@ -11,7 +11,9 @@ commands.add_command("fac_item_craft", nil, function(cmd)
     local recipe = c.entity.force.recipes[item]
     if not recipe then u.json_response({id = id, error = "Recipe not found"}); return end
     if not recipe.enabled then u.json_response({id = id, error = "Not unlocked"}); return end
-    if not c.entity.can_craft(recipe, count) then
+    -- can_craft is a LuaPlayer method; a controllerless companion character only has
+    -- get_craftable_count / begin_crafting (LuaControl), so gate on the craftable count.
+    if c.entity.get_craftable_count(recipe) < count then
       local missing = {}
       local inv = c.entity.get_inventory(defines.inventory.character_main)
       for _, ing in ipairs(recipe.ingredients) do
@@ -57,12 +59,12 @@ commands.add_command("fac_item_recipes", nil, function(cmd)
     for name, recipe in pairs(c.entity.force.recipes) do
       if recipe.enabled then
         local inc = true
-        if filter == "active" then inc = c.entity.can_craft(recipe, 1)
+        if filter == "active" then inc = c.entity.get_craftable_count(recipe) >= 1
         elseif filter and filter ~= "" then inc = name:find(filter, 1, true) end
         if inc then
           local ings = {}
           for _, ing in ipairs(recipe.ingredients) do ings[#ings + 1] = {name = ing.name, amount = ing.amount} end
-          result[#result + 1] = {name = name, ingredients = ings, can_craft = c.entity.can_craft(recipe, 1)}
+          result[#result + 1] = {name = name, ingredients = ings, can_craft = c.entity.get_craftable_count(recipe) >= 1}
         end
       end
     end
