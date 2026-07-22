@@ -1,8 +1,13 @@
+import { appendFileSync } from 'node:fs';
 import { RCONClient } from './rcon/client';
 import { getRCONConfig } from './config';
 import { connectWithRetry, sleep } from './utils/connection';
 
 const POLL_INTERVAL = 2000;
+
+// fac_chat_get is a destructive drain, so every message is appended here as it arrives -
+// this file, not the in-game queue, is the durable record an orchestrator reads.
+const LOG_PATH = `${import.meta.dir}/../.fac-messages.jsonl`;
 
 const client = new RCONClient(getRCONConfig());
 
@@ -10,17 +15,18 @@ let connected = false;
 
 async function pollMessages(): Promise<void> {
   try {
-    const response = await client.sendCommand('/fac_chat_get orchestrator');
+    // no filter: capture messages aimed at companions as well as the orchestrator
+    const response = await client.sendCommand('/fac_chat_get');
 
     if (response.success && response.data) {
       const messages = JSON.parse(response.data || '[]');
 
       if (Array.isArray(messages) && messages.length > 0) {
-        console.log('\n--- NEW MESSAGES ---');
-        messages.forEach((msg: { player: string; message: string; tick: number }) => {
-          console.log(`[${msg.player}] ${msg.message}`);
-        });
-        console.log('--------------------\n');
+        const received = new Date().toISOString();
+        for (const msg of messages as Array<{ player: string; message: string; tick: number; target_companion?: number }>) {
+          appendFileSync(LOG_PATH, JSON.stringify({ received, companionId: msg.target_companion ?? 0, ...msg }) + '\n');
+          console.log(`[${received}] [${msg.player}] ${msg.message}`);
+        }
       }
     }
   } catch (error) {
