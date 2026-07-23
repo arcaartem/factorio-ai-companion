@@ -3,3 +3,6 @@ pre-commit:
     validate-tools:
       run: bun run scripts/validate-tools.ts
       fail_text: "MCP tools don't match Lua commands 1:1. Run 'bun run scripts/validate-tools.ts' to see details."
+    test:
+      run: bun test
+      fail_text: "Unit tests failed. Run 'bun test' to see details."
