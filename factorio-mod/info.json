@@ -5,6 +5,8 @@
   "author": "lveillard",
   "contact": "lvei.goes553@aleeas.com",
   "factorio_version": "2.0",
-  "description": "AI companions with 52 RCON commands. Combat skill. Hybrid mining. Map markers. FLE-inspired queues. Factorio 2.x compatible.",
-  "dependencies": ["base >= 2.0"]
+  "description": "AI companions with 53 RCON commands. Combat skill. Hybrid mining. Map markers. FLE-inspired queues. Factorio 2.x compatible.",
+  "dependencies": [
+    "base >= 2.0"
+  ]
 }

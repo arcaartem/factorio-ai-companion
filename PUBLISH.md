@@ -42,7 +42,7 @@ AI companions for Factorio 2.x controlled via RCON. Features 51 commands, autono
 Control AI companions in Factorio 2.x using natural language through Claude Code and RCON.
 
 ## Features
-- **51 RCON Commands**: Complete API for AI control
+- **53 RCON Commands**: Complete API for AI control
 - **Autonomous Skills**: Mining, building, combat
 - **Hybrid Mining**: Native Factorio API + auto-restart
 - **Map Markers**: Track companions on the map
