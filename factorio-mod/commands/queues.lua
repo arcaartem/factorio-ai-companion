@@ -335,7 +335,7 @@ function M.start_harvest(cid, position, target_count, resource_name)
 
   M.start_mining_next(cid)
   -- Set inv_snapshot immediately after starting mining
-  storage.harvest_queues[cid].inv_snapshot = c.entity.get_main_inventory().get_contents()
+  storage.harvest_queues[cid].inv_snapshot = u.contents_to_map(c.entity.get_main_inventory().get_contents())
   return {started = true, entities = #entities, target = target_count, resource = resource_name}
 end
 
@@ -373,10 +373,14 @@ function M.tick_harvest_queues()
       return true
     end
 
-    -- Too far from mining area
-    if u.distance(c.entity.position, q.position) > MINING_RANGE then
-      c.entity.mining_state = {mining = false}
-      return true
+    -- Too far from mining area (reach enforcement is opt-in via c.realistic)
+    if c.realistic then
+      local limit = c.entity.resource_reach_distance or MINING_RANGE
+      if u.distance(c.entity.position, q.position) > limit then
+        c.entity.mining_state = {mining = false}
+        u.log_error("harvest aborted: too far", "companion " .. cid)
+        return true
+      end
     end
 
     -- Start mining first resource
@@ -385,7 +389,7 @@ function M.tick_harvest_queues()
         c.entity.mining_state = {mining = false}
         return true
       end
-      q.inv_snapshot = c.entity.get_main_inventory().get_contents()
+      q.inv_snapshot = u.contents_to_map(c.entity.get_main_inventory().get_contents())
       return false
     end
 
@@ -395,11 +399,14 @@ function M.tick_harvest_queues()
     -- When mining stops (entity depleted or finished), count inventory and move to next
     if not c.entity.mining_state or not c.entity.mining_state.mining then
       -- Mining stopped - count what we got
-      local inv_after = c.entity.get_main_inventory().get_contents()
+      -- Hot-reload guard: an old save may have persisted the pre-2.0 array-shaped snapshot.
+      if type(q.inv_snapshot[1]) == "table" then
+        q.inv_snapshot = u.contents_to_map(q.inv_snapshot)
+      end
+      local inv_after = u.contents_to_map(c.entity.get_main_inventory().get_contents())
       local added = 0
-      for name, data in pairs(inv_after) do
-        local before = q.inv_snapshot[name] and q.inv_snapshot[name].count or 0
-        added = added + (data.count - before)
+      for name, count in pairs(inv_after) do
+        added = added + math.max(0, count - (q.inv_snapshot[name] or 0))
       end
       q.harvested = q.harvested + added
 
@@ -415,7 +422,7 @@ function M.tick_harvest_queues()
         c.entity.mining_state = {mining = false}
         return true
       end
-      q.inv_snapshot = c.entity.get_main_inventory().get_contents()
+      q.inv_snapshot = u.contents_to_map(c.entity.get_main_inventory().get_contents())
     end
 
     return false
@@ -513,12 +520,8 @@ function M.start_build(cid, entity_name, position, direction)
   if not c then return {error = "Invalid companion"} end
 
   local dir = direction or defines.direction.north
-  local dist = u.distance(c.entity.position, position)
-  local reach = c.entity.build_distance or 10
-
-  if dist > reach then
-    return {error = "Too far (dist: " .. math.floor(dist) .. ", reach: " .. reach .. ")"}
-  end
+  local reach_err = u.check_reach(cid, c, position)
+  if reach_err then return reach_err end
 
   local inv = c.entity.get_main_inventory()
   if inv.get_item_count(entity_name) < 1 then
@@ -608,6 +611,7 @@ function M.tick_combat_queues()
     end
 
     if not q.current or not q.current.valid then
+      if q.current then q.kills = (q.kills or 0) + 1 end
       -- Find next valid target (build new list to avoid mutation during iteration)
       local valid_targets = {}
       for _, t in ipairs(q.targets) do
@@ -649,7 +653,8 @@ function M.get_combat_status(cid)
   return {
     active = true,
     targets_remaining = remaining,
-    current_target = q.current and q.current.valid and q.current.name or nil
+    current_target = q.current and q.current.valid and q.current.name or nil,
+    kills = q.kills or 0
   }
 end
 

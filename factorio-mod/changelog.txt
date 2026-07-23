@@ -1,4 +1,12 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.13.4
+Date: 2026-07-23
+  Bugfixes:
+    - Fixed inventory handling for Factorio 2.0's get_contents() array-of-records shape (harvest tracking, companion_disappear item spill, container/character inventory inspect) - previously misread as a name->count map
+    - Fixed error_response emitting hand-built JSON that broke on special characters; now uses the same safe table_to_json encoder as normal responses
+    - Reach enforcement (opt-in via companion_realistic) now applies to harvest and build queues, matching move/attack/pickup parity; harvest reach aborts are logged instead of silent
+    - Combat queue now counts and reports kills (get_combat_status.kills)
+---------------------------------------------------------------------------------------------------
 Version: 0.13.3
 Date: 2025-01-17
   Features:

@@ -53,9 +53,15 @@ commands.add_command("fac_companion_disappear", nil, function(cmd)
     local dropped = {}
     local inv = c.entity.get_inventory(defines.inventory.character_main)
     if inv then
-      for name, count in pairs(inv.get_contents()) do
-        surf.spill_item_stack(pos, {name = name, count = count}, true, nil, false)
-        dropped[#dropped + 1] = {name = name, count = count}
+      -- Factorio 2.0: get_contents() returns an array of {name, count, quality} records.
+      for _, item in pairs(inv.get_contents()) do
+        surf.spill_item_stack{
+          position = pos,
+          stack = {name = item.name, count = item.count, quality = item.quality},
+          enable_looted = true,
+          allow_belts = false
+        }
+        dropped[#dropped + 1] = {name = item.name, count = item.count}
       end
     end
     if c.label and c.label.valid then c.label.destroy() end
@@ -130,7 +136,7 @@ commands.add_command("fac_companion_inventory", nil, function(cmd)
       local items = {}
       for _, it in ipairs({{defines.inventory.chest, "chest"}, {defines.inventory.furnace_source, "in"}, {defines.inventory.furnace_result, "out"}, {defines.inventory.fuel, "fuel"}}) do
         local inv = t.get_inventory(it[1])
-        if inv then for name, count in pairs(inv.get_contents()) do items[#items + 1] = {name = name, count = count, slot = it[2]} end end
+        if inv then for _, item in pairs(inv.get_contents()) do items[#items + 1] = {name = item.name, count = item.count, quality = item.quality, slot = it[2]} end end
       end
       u.json_response({id = id, entity = t.name, items = items})
     else

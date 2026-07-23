@@ -29,12 +29,27 @@ function M.json_response(data)
   rcon.print(ok and result or '{"error":"JSON failed"}')
 end
 
-function M.error_response(msg, ctx)
+function M.log_error(msg, ctx)
   if storage.errors then
     table.insert(storage.errors, {context = ctx or "rcon", error = tostring(msg), tick = game.tick})
     if #storage.errors > 50 then table.remove(storage.errors, 1) end
   end
-  rcon.print('{"error":"' .. tostring(msg) .. '"}')
+end
+
+function M.error_response(msg, ctx)
+  M.log_error(msg, ctx)
+  local ok, out = pcall(helpers.table_to_json, {error = tostring(msg)})
+  rcon.print(ok and out or '{"error":"error encoding failed"}')
+end
+
+-- Factorio 2.0: get_contents() returns an array of {name, count, quality} records.
+-- Sums across qualities into a plain name -> count map.
+function M.contents_to_map(contents)
+  local map = {}
+  for _, item in pairs(contents) do
+    map[item.name] = (map[item.name] or 0) + item.count
+  end
+  return map
 end
 
 function M.safe_command(callback)
