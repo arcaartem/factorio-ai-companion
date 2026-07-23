@@ -1,19 +1,54 @@
 import { Socket } from "net";
-import { RCONConfig, RCONResponse } from "./types";
+import type { RCONConfig, RCONResponse } from "./types";
+
+const SERVERDATA_AUTH = 3;
+const SERVERDATA_EXECCOMMAND = 2;
+
+interface PendingRequest {
+  resolve: (response: RCONResponse) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
 
 export class RCONClient {
   private socket: Socket | null = null;
   private connected = false;
   private config: RCONConfig;
   private requestId = 1;
-  private commandTimeout = 5000; // 5 second timeout per command
+  private commandTimeout = 5000; // 5 second default timeout per command, overridable per call
+
+  // Incoming-byte accumulator for length-prefixed packet framing. RCON packets
+  // can arrive split across TCP segments or coalesced together in one "data"
+  // event, so we buffer and only extract a packet once we have its full length.
+  private recvBuffer: Buffer = Buffer.alloc(0);
+
+  // Requests in flight, keyed by RCON packet id, so responses are routed to
+  // the caller that sent them regardless of arrival order (fixes cross-talk
+  // between concurrent callers sharing one connection).
+  private pending = new Map<number, PendingRequest>();
+
+  // The request id currently awaiting an auth response, so we can recognize
+  // the protocol's id=-1 "auth failed" reply and route it back correctly.
+  private authPendingId: number | null = null;
+
+  // Dedupe concurrent reconnect attempts (multiple sendCommand callers can
+  // notice a dead socket at the same time) so they share one connect().
+  private connectingPromise: Promise<void> | null = null;
 
   constructor(config: RCONConfig) {
     this.config = config;
   }
 
   async connect(): Promise<void> {
-    return this.connectWithRetry(3);
+    if (this.connectingPromise) {
+      return this.connectingPromise;
+    }
+    const promise = this.connectWithRetry(3).finally(() => {
+      if (this.connectingPromise === promise) {
+        this.connectingPromise = null;
+      }
+    });
+    this.connectingPromise = promise;
+    return promise;
   }
 
   private async connectWithRetry(maxRetries: number): Promise<void> {
@@ -53,115 +88,222 @@ export class RCONClient {
 
   private async connectOnce(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.socket = new Socket();
-      this.socket.setTimeout(this.commandTimeout);
+      // Tear down whatever socket we had before (if any) without letting its
+      // close/error events reject requests made against the new connection.
+      if (this.socket) {
+        this.socket.removeAllListeners();
+        this.socket.destroy();
+      }
 
-      this.socket.on("connect", () => {
+      const socket = new Socket();
+      this.socket = socket;
+      this.recvBuffer = Buffer.alloc(0);
+      let settled = false;
+
+      // Detect genuinely-dead TCP peers (server crash, network drop) even
+      // while idle, instead of relying on application-level activity.
+      socket.setKeepAlive(true, 10000);
+
+      // Guard only the connect+auth handshake. Once authenticated we disable
+      // this timer entirely — per-command timeouts (via `pending`) are what
+      // bound normal operation, and an idle *connection* is not an error.
+      socket.setTimeout(this.commandTimeout);
+
+      socket.on("connect", () => {
         this.authenticate()
           .then(() => {
+            settled = true;
+            socket.setTimeout(0);
             this.connected = true;
             resolve();
           })
-          .catch(reject);
+          .catch((err) => {
+            settled = true;
+            socket.setTimeout(0);
+            socket.destroy();
+            reject(err);
+          });
       });
 
-      this.socket.on("error", (err) => {
-        this.connected = false;
-        reject(err);
+      socket.on("data", (chunk: Buffer) => this.onSocketData(chunk));
+
+      socket.on("error", (err: Error) => {
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
+        this.handleSocketDown(err.message);
       });
 
-      this.socket.on("timeout", () => {
-        this.socket?.destroy();
-        reject(new Error("Socket timeout"));
+      socket.on("close", () => {
+        this.handleSocketDown("socket closed");
       });
 
-      this.socket.connect(this.config.port, this.config.host);
+      socket.on("timeout", () => {
+        if (!settled) {
+          settled = true;
+          socket.destroy();
+          reject(new Error("Socket connect/auth timeout"));
+        }
+        // If already connected, this timer has been disabled (setTimeout(0));
+        // a stray event here is not treated as a failure.
+      });
+
+      socket.connect(this.config.port, this.config.host);
     });
   }
 
   private async authenticate(): Promise<void> {
-    const packet = this.createPacket(3, this.config.password);
+    if (!this.socket) throw new Error("Socket not initialized");
+    const socket = this.socket;
+    const id = this.nextRequestId();
+    const packet = this.createPacket(SERVERDATA_AUTH, this.config.password, id);
+
     return new Promise((resolve, reject) => {
-      if (!this.socket) return reject(new Error("Socket not initialized"));
-
-      this.socket.write(packet);
-
-      const timeout = setTimeout(() => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        this.authPendingId = null;
         reject(new Error("Authentication timeout"));
       }, this.commandTimeout);
 
-      this.socket.once("data", (data) => {
-        clearTimeout(timeout);
-        const response = this.parsePacket(data);
-        if (response.id === -1) {
-          reject(new Error("Authentication failed - invalid password"));
-        } else {
-          resolve();
+      this.authPendingId = id;
+      this.pending.set(id, {
+        timer,
+        resolve: (response) => {
+          this.authPendingId = null;
+          if (response.success) {
+            resolve();
+          } else {
+            reject(new Error(response.error || "Authentication failed - invalid password"));
+          }
+        },
+      });
+
+      socket.write(packet);
+    });
+  }
+
+  async sendCommand(command: string, timeoutMs?: number): Promise<RCONResponse> {
+    if (!this.isSocketUsable()) {
+      try {
+        await this.connect();
+      } catch (error: any) {
+        return {
+          success: false,
+          data: "",
+          error: `Connection lost and reconnect failed: ${error?.message || String(error)}`,
+        };
+      }
+    }
+
+    const socket = this.socket;
+    if (!socket) {
+      return { success: false, data: "", error: "Socket not initialized" };
+    }
+
+    const id = this.nextRequestId();
+    const packet = this.createPacket(SERVERDATA_EXECCOMMAND, command, id);
+    const timeout = timeoutMs ?? this.commandTimeout;
+
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        resolve({
+          success: false,
+          data: "",
+          error: `Command timeout after ${timeout}ms`,
+        });
+      }, timeout);
+
+      this.pending.set(id, { timer, resolve });
+
+      socket.write(packet, (err) => {
+        if (err) {
+          this.pending.delete(id);
+          clearTimeout(timer);
+          resolve({ success: false, data: "", error: `Write failed: ${err.message}` });
         }
       });
     });
   }
 
-  async sendCommand(command: string, timeoutMs?: number): Promise<RCONResponse> {
-    if (!this.connected) {
-      // Try to reconnect
-      try {
-        await this.connect();
-      } catch (error) {
-        return { success: false, data: "", error: "Not connected and reconnect failed" };
-      }
-    }
-
-    const packet = this.createPacket(2, command);
-
-    return new Promise((resolve) => {
-      if (!this.socket) {
-        return resolve({ success: false, data: "", error: "Socket not initialized" });
-      }
-
-      let resolved = false;
-      const cleanup = () => {
-        if (this.socket) {
-          this.socket.removeListener("data", onData);
-          this.socket.removeListener("error", onError);
-        }
-        clearTimeout(timeout);
-      };
-
-      const finish = (result: RCONResponse) => {
-        if (!resolved) {
-          resolved = true;
-          cleanup();
-          resolve(result);
-        }
-      };
-
-      const timeout = setTimeout(() => {
-        finish({
-          success: false,
-          data: "",
-          error: `Command timeout after ${timeoutMs || this.commandTimeout}ms`,
-        });
-      }, timeoutMs || this.commandTimeout);
-
-      const onData = (data: Buffer) => {
-        const response = this.parsePacket(data);
-        finish({ success: true, data: response.payload });
-      };
-
-      const onError = (err: Error) => {
-        this.connected = false;
-        finish({ success: false, data: "", error: err.message });
-      };
-
-      this.socket.once("data", onData);
-      this.socket.once("error", onError);
-      this.socket.write(packet);
-    });
+  /** True only if we believe there is a live, usable socket to write to. */
+  private isSocketUsable(): boolean {
+    return this.connected && !!this.socket && !this.socket.destroyed;
   }
 
-  private createPacket(type: number, payload: string): Buffer {
+  /** Marks the connection dead and fails every in-flight request with a clear error. */
+  private handleSocketDown(reason: string): void {
+    if (!this.connected && this.pending.size === 0) return; // already handled
+    this.connected = false;
+    const error = `Connection lost: ${reason}`;
+    for (const [, request] of this.pending) {
+      clearTimeout(request.timer);
+      request.resolve({ success: false, data: "", error });
+    }
+    this.pending.clear();
+    this.authPendingId = null;
+    this.recvBuffer = Buffer.alloc(0);
+  }
+
+  /** Accumulates bytes and dispatches complete, length-prefixed RCON packets. */
+  private onSocketData(chunk: Buffer): void {
+    this.recvBuffer = this.recvBuffer.length ? Buffer.concat([this.recvBuffer, chunk]) : chunk;
+
+    while (this.recvBuffer.length >= 4) {
+      const length = this.recvBuffer.readInt32LE(0);
+      if (length < 10) {
+        // Malformed/unexpected packet - drop the buffer rather than spin forever.
+        console.error(`RCON: dropping malformed packet (length=${length})`);
+        this.recvBuffer = Buffer.alloc(0);
+        break;
+      }
+
+      const totalSize = length + 4;
+      if (this.recvBuffer.length < totalSize) break; // wait for the rest to arrive
+
+      const packet = this.recvBuffer.subarray(0, totalSize);
+      this.recvBuffer = this.recvBuffer.subarray(totalSize);
+
+      this.dispatchPacket(packet);
+    }
+  }
+
+  private dispatchPacket(buffer: Buffer): void {
+    const { id, payload } = this.parsePacket(buffer);
+
+    // Failed auth: server echoes id=-1 rather than the id we sent.
+    if (id === -1 && this.authPendingId !== null) {
+      const pending = this.pending.get(this.authPendingId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pending.delete(this.authPendingId);
+        pending.resolve({ success: false, data: "", error: "Authentication failed - invalid password" });
+      }
+      return;
+    }
+
+    const pending = this.pending.get(id);
+    if (!pending) {
+      // No caller is waiting for this id anymore (already timed out, or an
+      // unexpected/late packet) - drop it rather than crash.
+      return;
+    }
+
+    clearTimeout(pending.timer);
+    this.pending.delete(id);
+    pending.resolve({ success: true, data: payload });
+  }
+
+  private nextRequestId(): number {
     const id = this.requestId++;
+    if (this.requestId >= 0x7fffffff) {
+      this.requestId = 1;
+    }
+    return id;
+  }
+
+  private createPacket(type: number, payload: string, id: number): Buffer {
     const payloadBuffer = Buffer.from(payload, "utf8");
     const length = payloadBuffer.length + 10;
 
@@ -194,9 +336,11 @@ export class RCONClient {
 
   async disconnect(): Promise<void> {
     if (this.socket) {
+      this.socket.removeAllListeners();
       this.socket.destroy();
       this.socket = null;
-      this.connected = false;
     }
+    this.connected = false;
+    this.handleSocketDown("disconnect() called");
   }
 }
