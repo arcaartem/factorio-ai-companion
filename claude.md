@@ -81,6 +81,7 @@ Restart Factorio.
 - **`/silent-command` runs in the level script context**, which has its own `storage` separate from the mod's — it cannot read or write `storage.companions`, `storage.companion_messages`, etc. `game`, surfaces and entities are reachable. Anything touching mod state must go through a `/fac_*` command.
 - **RCON idle socket:** the client uses one socket with `socket.once("data")` and no request-ID correlation. Sleeping ~30s on an open connection makes every later command silently fail. Sleep *before* connecting; keep scripts short with fresh connections.
 - **Companions are controllerless characters:** they have `begin_crafting` / `get_craftable_count` (LuaControl) but NOT `can_craft` (LuaPlayer). Their crafting queue does run to completion unattended.
+- **Companion crafting doesn't count for research:** `c.entity.begin_crafting{...}` on a companion produces the item but does NOT register in `force.get_item_production_statistics()` - verified live, dozens of companion-crafted items all read 0 input count. Factorio 2.0 `craft-item` trigger technologies (e.g. `automation-science-pack` fires on crafting 1 lab) read that same statistic, so a companion can never satisfy one by crafting alone. Fix: either produce the item from a machine (furnace/assembler, which does register), or use `item_craft`'s `credited=true` mode, which runs `game.players[1].begin_crafting{...}` instead - this registers correctly, at the cost of spending the human player's inventory and crafting queue.
 
 ## Troubleshooting
 

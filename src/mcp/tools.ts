@@ -147,12 +147,17 @@ export const TOOLS: Record<string, {
     }
   },
   item_craft: {
-    desc: "Craft an item (instant)",
-    rcon: "/fac_item_craft {companionId} {recipe} {count}",
+    desc: "Craft an item (instant). By default the companion crafts from its own inventory, which does NOT register in the force's item production statistics (companions are controllerless characters) - so it can never satisfy a craft-item trigger technology. Set credited=true to have the connected player craft instead: it DOES register (needed for craft-item research triggers), but spends the player's own inventory and occupies the player's crafting queue.",
+    rcon: "/fac_item_craft {companionId} {recipe} {count} {credited}",
     params: {
       companionId: { type: "number", required: true },
       recipe: { type: "string", required: true },
-      count: { type: "number", default: 1 }
+      count: { type: "number", default: 1 },
+      credited: {
+        type: "boolean",
+        desc: "Craft as the connected player (credited toward production statistics) instead of the companion. Consumes the player's inventory and crafting queue. Default false = companion crafts as before.",
+        required: false
+      }
     }
   },
   item_craft_start: {

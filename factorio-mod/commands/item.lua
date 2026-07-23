@@ -2,28 +2,54 @@
 local u = require("commands.init")
 local queues = require("commands.queues")
 
+local function missing_ingredients(inv, recipe, count)
+  local missing = {}
+  for _, ing in ipairs(recipe.ingredients) do
+    local have, need = inv.get_item_count(ing.name), ing.amount * count
+    if have < need then missing[#missing + 1] = {name = ing.name, have = have, need = need} end
+  end
+  return missing
+end
+
+-- Trailing optional arg selects who crafts: default (omitted/off) is the companion,
+-- crafting from its own inventory - fast, but does NOT register in the force's item
+-- production statistics (companions are controllerless characters), so it can never
+-- satisfy a craft-item trigger technology. "on"/"true"/"1" switches to the connected
+-- PLAYER crafting instead ("credited"): it DOES register, but spends the player's own
+-- inventory and occupies the player's crafting queue.
 commands.add_command("fac_item_craft", nil, function(cmd)
   u.safe_command(function()
-    local args = u.parse_args("^(%S+)%s+(%S+)%s*(%d*)$", cmd.parameter)
+    local args = u.parse_args("^(%S+)%s+(%S+)%s*(%d*)%s*(%S*)$", cmd.parameter)
     local id, c = u.find_companion(args[1])
     if not id then u.error_response("Companion not found"); return end
     local item, count = args[2], tonumber(args[3]) or 1
+    local mode = (args[4] or ""):lower()
+    local credited = (mode == "on" or mode == "true" or mode == "1")
     local recipe = c.entity.force.recipes[item]
     if not recipe then u.json_response({id = id, error = "Recipe not found"}); return end
     if not recipe.enabled then u.json_response({id = id, error = "Not unlocked"}); return end
+
+    if credited then
+      local p = game.players[1]
+      if not p or not p.valid then u.json_response({id = id, error = "No player"}); return end
+      if not p.character then u.json_response({id = id, error = "Player has no character"}); return end
+      if p.get_craftable_count(recipe) < count then
+        local missing = missing_ingredients(p.get_main_inventory(), recipe, count)
+        u.json_response({id = id, error = "Missing", missing = missing, credited = true}); return
+      end
+      local crafted = p.begin_crafting{recipe = item, count = count}
+      u.json_response({id = id, crafted = crafted, item = item, credited = true})
+      return
+    end
+
     -- can_craft is a LuaPlayer method; a controllerless companion character only has
     -- get_craftable_count / begin_crafting (LuaControl), so gate on the craftable count.
     if c.entity.get_craftable_count(recipe) < count then
-      local missing = {}
-      local inv = c.entity.get_inventory(defines.inventory.character_main)
-      for _, ing in ipairs(recipe.ingredients) do
-        local have, need = inv.get_item_count(ing.name), ing.amount * count
-        if have < need then missing[#missing + 1] = {name = ing.name, have = have, need = need} end
-      end
-      u.json_response({id = id, error = "Missing", missing = missing}); return
+      local missing = missing_ingredients(c.entity.get_inventory(defines.inventory.character_main), recipe, count)
+      u.json_response({id = id, error = "Missing", missing = missing, credited = false}); return
     end
     local crafted = c.entity.begin_crafting{recipe = item, count = count}
-    u.json_response({id = id, crafted = crafted, item = item})
+    u.json_response({id = id, crafted = crafted, item = item, credited = false})
   end)
 end)
 
