@@ -26,6 +26,8 @@ export async function buildSmelterLine(
   const id = ctx.companionId;
   const placed: string[] = [];
   const errors: string[] = [];
+  let furnacesPlaced = 0;
+  let insertersPlaced = 0;
 
   // Calculate spacing based on furnace size (2x2 for all furnace types)
   const spacing = 2;
@@ -74,6 +76,7 @@ export async function buildSmelterLine(
     try {
       await exec(ctx, `/fac_building_place ${id} ${furnaceType} ${furnacePos.x} ${furnacePos.y}`);
       placed.push(`${furnaceType} at (${furnacePos.x}, ${furnacePos.y})`);
+      furnacesPlaced++;
     } catch (e) {
       errors.push(`Failed to place ${furnaceType} at (${furnacePos.x}, ${furnacePos.y}): ${e}`);
       continue;
@@ -92,6 +95,7 @@ export async function buildSmelterLine(
           `/fac_building_place ${id} inserter ${inserterPos.x} ${inserterPos.y} ${inserterDir}`
         );
         placed.push(`inserter at (${inserterPos.x}, ${inserterPos.y})`);
+        insertersPlaced++;
       } else {
         errors.push(`Cannot place inserter at (${inserterPos.x}, ${inserterPos.y})`);
       }
@@ -100,19 +104,21 @@ export async function buildSmelterLine(
     }
   }
 
-  const success = placed.length > 0;
+  const success = furnacesPlaced > 0;
   const message = success
-    ? `Built smelter line: ${placed.length} entities placed${errors.length ? `, ${errors.length} errors` : ""}`
+    ? `Built smelter line: ${furnacesPlaced} furnace(s), ${insertersPlaced} inserter(s)${errors.length ? `, ${errors.length} errors` : ""}`
     : `Failed to build smelter line: ${errors.join("; ")}`;
 
   return {
     success,
     message,
     data: {
+      furnacesPlaced,
+      insertersPlaced,
+      requested: count,
       placed,
       errors,
       furnaceType,
-      count: Math.floor(placed.length / 2), // furnace + inserter pairs
     },
   };
 }

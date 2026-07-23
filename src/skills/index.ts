@@ -49,4 +49,3 @@ export async function exec(
 
 // Export skills
 export { buildSmelterLine } from "./build-smelter-line";
-export { autoMineResources } from "./auto-mine-resources";

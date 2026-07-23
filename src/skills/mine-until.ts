@@ -9,7 +9,8 @@ const WALKING_TIMEOUT = 60000;
 
 const companionId = parseInt(process.argv[2]);
 const resourceType = process.argv[3];
-const targetAmount = parseInt(process.argv[4]) || 50;
+const parsedTargetAmount = parseInt(process.argv[4]);
+const targetAmount = process.argv[4] === undefined || isNaN(parsedTargetAmount) ? 50 : parsedTargetAmount;
 
 if (!companionId || !resourceType) {
   console.error("Usage: bun run src/skills/mine-until.ts <companionId> <resource> <targetAmount>");
@@ -117,12 +118,13 @@ async function waitForMiningComplete(): Promise<number> {
 
 
 async function main(): Promise<void> {
+  let totalMined = 0;
+
   try {
     await client.connect();
     console.log(`[Companion #${companionId}] Starting mine-until: ${resource} x${targetAmount}`);
     await say(`Starting to mine ${resource} until I have ${targetAmount}...`);
 
-    let totalMined = 0;
     let attempts = 0;
     const maxAttempts = 50; // Prevent infinite loops
     const visitedSpots = new Set<string>(); // Track visited spots to avoid loops
@@ -206,14 +208,31 @@ async function main(): Promise<void> {
 
     // Final report
     const finalCount = await getInventoryCount(resource);
+    const success = finalCount >= targetAmount;
     await say(`Done! I have ${finalCount} ${resource} in inventory.`);
     console.log(`[#${companionId}] Done. Inventory: ${finalCount} ${resource}`);
+    if (!success) process.exitCode = 1;
+    console.log(`SKILL_RESULT ${JSON.stringify({
+      skill: "mine-until",
+      companionId,
+      mined: finalCount,
+      target: targetAmount,
+      success,
+    })}`);
 
   } catch (error) {
     console.error(`[#${companionId}] Error:`, error);
     try {
       await say(`Error during mining: ${error}`);
     } catch {}
+    process.exitCode = 1;
+    console.log(`SKILL_RESULT ${JSON.stringify({
+      skill: "mine-until",
+      companionId,
+      mined: totalMined,
+      target: targetAmount,
+      success: false,
+    })}`);
   } finally {
     await client.disconnect();
   }

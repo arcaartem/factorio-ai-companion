@@ -9,7 +9,8 @@ const SCAN_RADIUS = 50;
 
 const companionId = parseInt(process.argv[2]);
 const targetType = process.argv[3] || "all"; // all, spawner, worm, biter, spitter
-const maxKills = parseInt(process.argv[4]) || 10;
+const parsedMaxKills = parseInt(process.argv[4]);
+const maxKills = process.argv[4] === undefined || isNaN(parsedMaxKills) ? 10 : parsedMaxKills;
 
 if (!companionId) {
   console.error("Usage: bun run src/skills/combat-until.ts <companionId> [targetType] [maxKills]");
@@ -17,6 +18,25 @@ if (!companionId) {
 }
 
 const client = new RCONClient(getRCONConfig());
+
+class CompanionGoneError extends Error {}
+
+// Tracks consecutive failed position/health reads. Either signal counts
+// toward the same streak - after MAX_NULL_READS in a row the companion is
+// treated as dead/gone (destroyed entity => "Companion not found" upstream).
+const MAX_NULL_READS = 3;
+let nullReadStreak = 0;
+
+function trackAliveness(gotReading: boolean): void {
+  if (gotReading) {
+    nullReadStreak = 0;
+    return;
+  }
+  nullReadStreak++;
+  if (nullReadStreak >= MAX_NULL_READS) {
+    throw new CompanionGoneError(`No position/health reading for ${companionId} after ${nullReadStreak} attempts`);
+  }
+}
 
 async function say(msg: string): Promise<void> {
   await client.sendCommand(`/fac_chat_say ${companionId} "${msg}"`);
@@ -38,12 +58,16 @@ async function stopAll(): Promise<void> {
 
 async function getPosition(): Promise<{x: number, y: number} | null> {
   const data = await exec(`/fac_companion_position ${companionId}`);
-  return data?.position || null;
+  const pos = data?.position || null;
+  trackAliveness(pos !== null);
+  return pos;
 }
 
 async function getHealth(): Promise<{health: number, max: number, pct: number} | null> {
   const data = await exec(`/fac_companion_health ${companionId}`);
-  return data?.self || null;
+  const health = data?.self || null;
+  trackAliveness(health !== null);
+  return health;
 }
 
 interface Enemy {
@@ -91,9 +115,13 @@ async function walkTo(x: number, y: number): Promise<boolean> {
   return false;
 }
 
-async function attack(x: number, y: number): Promise<{kills: number}> {
+async function attack(
+  x: number,
+  y: number,
+  startPos: {x: number, y: number} | null
+): Promise<{kills: number, retreated: boolean}> {
   const result = await exec(`/fac_action_attack_start ${companionId} ${x} ${y}`);
-  if (!result?.started) return {kills: 0};
+  if (!result?.started) return {kills: 0, retreated: false};
 
   let totalKills = 0;
   const startTime = Date.now();
@@ -101,34 +129,41 @@ async function attack(x: number, y: number): Promise<{kills: number}> {
 
   while (Date.now() - startTime < timeout) {
     const status = await exec(`/fac_action_attack_status ${companionId}`);
+    totalKills = status?.status?.kills ?? totalKills;
 
     if (!status?.status?.active) {
-      totalKills = status?.status?.kills || 0;
       break;
     }
 
     const health = await getHealth();
     if (health && health.pct < 30) {
-      await say("Health low, retreating!");
       await exec(`/fac_action_attack_stop ${companionId}`);
-      return {kills: totalKills};
+      await say("Health low, retreating!");
+      if (startPos) {
+        await walkTo(startPos.x, startPos.y);
+      }
+      return {kills: totalKills, retreated: true};
     }
 
     await sleep(POLL_INTERVAL);
   }
 
-  return {kills: totalKills};
+  return {kills: totalKills, retreated: false};
 }
 
 async function main(): Promise<void> {
+  let totalKills = 0;
+  let outcome: "success" | "retreated" | "no-targets" | "max-attempts" | "gone" | "error" = "success";
+
   try {
     await client.connect();
     console.log(`[Companion #${companionId}] Starting combat: ${targetType}, max ${maxKills} kills`);
 
+    const startPos = await getPosition();
+
     await stopAll();
     await say(`Combat mode: hunting ${targetType}!`);
 
-    let totalKills = 0;
     let attempts = 0;
     const maxAttempts = 30;
 
@@ -138,6 +173,7 @@ async function main(): Promise<void> {
       const enemies = await scanEnemies();
       if (enemies.length === 0) {
         await say(`No more ${targetType} enemies in range.`);
+        outcome = "no-targets";
         break;
       }
 
@@ -154,7 +190,7 @@ async function main(): Promise<void> {
       }
 
       await say(`Attacking ${target.name}!`);
-      const result = await attack(target.position.x, target.position.y);
+      const result = await attack(target.position.x, target.position.y, startPos);
       totalKills += result.kills;
 
       console.log(`[#${companionId}] Kills this round: ${result.kills}, total: ${totalKills}`);
@@ -163,18 +199,48 @@ async function main(): Promise<void> {
         await say(`Killed ${result.kills}! Total: ${totalKills}/${maxKills}`);
       }
 
+      if (result.retreated) {
+        outcome = "retreated";
+        console.log(`[#${companionId}] Retreated to start position after ${totalKills} kills.`);
+        break;
+      }
+
       await sleep(500);
     }
 
-    await say(`Combat done! ${totalKills} kills.`);
-    console.log(`[#${companionId}] Combat complete. Total kills: ${totalKills}`);
+    if (outcome === "success" && attempts >= maxAttempts && totalKills < maxKills) {
+      outcome = "max-attempts";
+    }
 
+    if (outcome !== "retreated") {
+      await say(`Combat done! ${totalKills} kills.`);
+      console.log(`[#${companionId}] Combat complete. Total kills: ${totalKills}`);
+    }
+
+    if (outcome !== "success") {
+      process.exitCode = 1;
+    }
   } catch (error) {
-    console.error(`[#${companionId}] Error:`, error);
-    try {
-      await say(`Error: ${error}`);
-    } catch {}
+    if (error instanceof CompanionGoneError) {
+      outcome = "gone";
+      console.error(`[#${companionId}] Companion gone: ${error.message}`);
+    } else {
+      outcome = "error";
+      console.error(`[#${companionId}] Error:`, error);
+      try {
+        await say(`Error: ${error}`);
+      } catch {}
+    }
+    process.exitCode = 1;
   } finally {
+    console.log(`SKILL_RESULT ${JSON.stringify({
+      skill: "combat-until",
+      companionId,
+      kills: totalKills,
+      target: maxKills,
+      outcome,
+      success: outcome === "success",
+    })}`);
     await client.disconnect();
   }
 }
