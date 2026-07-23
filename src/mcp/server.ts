@@ -5,8 +5,13 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { spawn } from "child_process";
+import { mkdirSync, openSync, closeSync } from "fs";
+import { join } from "path";
 import { RCONClient } from "../rcon/client";
+import { buildSmelterLine } from "../skills/build-smelter-line";
 import { TOOLS, SKILLS, generateToolSchemas, generateSkillSchemas, buildRCONCommand } from "./tools";
+
+const SKILLS_LOG_DIR = ".fac-skills";
 
 // Track running skills by companionId
 interface RunningSkill {
@@ -15,6 +20,16 @@ interface RunningSkill {
   startTime: number;
 }
 const runningSkills = new Map<number, RunningSkill>();
+
+// Last completed skill run per companionId, so a caller can find out what
+// happened after the fact (background skills otherwise report nothing back).
+interface SkillRunResult {
+  skillName: string;
+  exitCode: number | null;
+  endedAt: number;
+  logPath: string;
+}
+const lastSkillResults = new Map<number, SkillRunResult>();
 
 export class FactorioMCPServer {
   private server: Server;
@@ -99,7 +114,17 @@ export class FactorioMCPServer {
           }
         }
 
-        const cmd = buildRCONCommand(toolName, args);
+        let cmd: string;
+        try {
+          cmd = buildRCONCommand(toolName, args);
+        } catch (error) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`
+            }]
+          };
+        }
         return execRCON(cmd);
       }
 
@@ -125,11 +150,16 @@ export class FactorioMCPServer {
           return String(value);
         });
 
+        mkdirSync(SKILLS_LOG_DIR, { recursive: true });
+        const logPath = join(SKILLS_LOG_DIR, `${companionId}-${toolName}-${Date.now()}.log`);
+        const logFd = openSync(logPath, "a");
+
         const proc = spawn("bun", ["run", `src/${skill.script}`, ...scriptArgs], {
           cwd: process.cwd(),
           detached: true,
-          stdio: "ignore"
+          stdio: ["ignore", logFd, logFd]
         });
+        closeSync(logFd); // the child holds its own duped descriptor now
 
         // Track the running skill
         runningSkills.set(companionId, {
@@ -139,8 +169,14 @@ export class FactorioMCPServer {
         });
 
         // Clean up when process exits
-        proc.on("exit", () => {
+        proc.on("exit", (code) => {
           runningSkills.delete(companionId);
+          lastSkillResults.set(companionId, {
+            skillName: toolName,
+            exitCode: code,
+            endedAt: Date.now(),
+            logPath
+          });
         });
 
         proc.unref();
@@ -168,10 +204,16 @@ export class FactorioMCPServer {
           skills[id] = skill;
         });
 
+        const lastResults: Record<number, SkillRunResult> = {};
+        lastSkillResults.forEach((result, id) => {
+          lastResults[id] = result;
+        });
+
         const status = {
           companions: companions.companions || {},
           companionCount: companions.count || 0,
           runningSkills: skills,
+          lastSkillResults: lastResults,
           instructions: {
             step1: "Spawn companions: companion_spawn(companionId: 1)",
             step2: "Start reactive loop: Bash(run_in_background: true): bun run src/reactive-all.ts",
@@ -212,7 +254,11 @@ export class FactorioMCPServer {
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ ...position, skill: skillInfo })
+            text: JSON.stringify({
+              ...position,
+              skill: skillInfo,
+              lastSkillResult: lastSkillResults.get(companionId) ?? null
+            })
           }]
         };
       }
@@ -233,6 +279,28 @@ export class FactorioMCPServer {
             type: "text" as const,
             text: `${stopMsg}. Cleared Lua queues.`
           }]
+        };
+      }
+
+      // build_smelter_line - synchronous placement, runs instantly (no background process)
+      if (toolName === "build_smelter_line") {
+        const { companionId, x, y, count, furnaceType, direction, inputSide } = args;
+        if (companionId === undefined || x === undefined || y === undefined || count === undefined) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: "Error: Missing required argument(s): companionId, x, y, count"
+            }]
+          };
+        }
+
+        const result = await buildSmelterLine(
+          { rcon: this.rcon, companionId },
+          { start: { x, y }, count, furnaceType, direction, inputSide }
+        );
+
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(result) }]
         };
       }
 
@@ -263,7 +331,7 @@ export class FactorioMCPServer {
         }
       }
     } catch (error) {
-      // Silently ignore polling errors
+      console.error("checkForMessages failed:", error instanceof Error ? error.message : error);
     }
   }
 

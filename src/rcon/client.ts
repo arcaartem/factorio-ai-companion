@@ -34,6 +34,12 @@ export class RCONClient {
   // notice a dead socket at the same time) so they share one connect().
   private connectingPromise: Promise<void> | null = null;
 
+  // Consecutive command-timeout counter, reset on any successful dispatch.
+  // Two in a row means the socket is dead-but-"connected" (e.g. server
+  // stopped responding without closing the TCP connection) - self-heal by
+  // tearing it down so the next sendCommand() reconnects.
+  private consecutiveTimeouts = 0;
+
   constructor(config: RCONConfig) {
     this.config = config;
   }
@@ -208,6 +214,12 @@ export class RCONClient {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        this.consecutiveTimeouts++;
+        if (this.consecutiveTimeouts >= 2) {
+          console.error("RCON: 2 consecutive command timeouts, tearing down socket");
+          this.socket?.destroy();
+          this.handleSocketDown("repeated command timeouts");
+        }
         resolve({
           success: false,
           data: "",
@@ -252,11 +264,17 @@ export class RCONClient {
 
     while (this.recvBuffer.length >= 4) {
       const length = this.recvBuffer.readInt32LE(0);
-      if (length < 10) {
-        // Malformed/unexpected packet - drop the buffer rather than spin forever.
-        console.error(`RCON: dropping malformed packet (length=${length})`);
-        this.recvBuffer = Buffer.alloc(0);
-        break;
+      if (length < 10 || length > 1_048_576) {
+        // Out-of-range length field means we've lost the packet boundary -
+        // dropping just this buffer and continuing desyncs every future read
+        // (the next bytes we treat as a length prefix are actually mid-payload).
+        // Treat it as fatal: tear down the socket and let handleSocketDown fail
+        // in-flight requests; sendCommand()'s isSocketUsable() check then
+        // reconnects cleanly on the next call.
+        console.error(`RCON: framing desync (length=${length}), destroying socket`);
+        this.socket?.destroy();
+        this.handleSocketDown(`framing desync (length=${length})`);
+        return;
       }
 
       const totalSize = length + 4;
@@ -292,6 +310,7 @@ export class RCONClient {
 
     clearTimeout(pending.timer);
     this.pending.delete(id);
+    this.consecutiveTimeouts = 0;
     pending.resolve({ success: true, data: payload });
   }
 

@@ -1,9 +1,3 @@
-import { z } from "zod";
-
-export const SendMessageSchema = z.object({
-  message: z.string(),
-});
-
 // Single source of truth for all MCP tools
 // Format: toolName -> { desc, rcon (template), params }
 export const TOOLS: Record<string, {
@@ -488,6 +482,23 @@ const SPECIAL_TOOLS = [
       },
       required: ["companionId"]
     }
+  },
+  {
+    name: "build_smelter_line",
+    description: "HIGH-LEVEL: Build a line of furnaces each with a feeding inserter. Synchronous - returns structured placement results.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        companionId: { type: "number", description: "Companion ID" },
+        x: { type: "number", description: "Start X coordinate" },
+        y: { type: "number", description: "Start Y coordinate" },
+        count: { type: "number", description: "Number of furnaces to place" },
+        furnaceType: { type: "string", description: "stone-furnace | steel-furnace | electric-furnace" },
+        direction: { type: "string", description: "horizontal | vertical" },
+        inputSide: { type: "string", description: "left | right | top | bottom" }
+      },
+      required: ["companionId", "x", "y", "count"]
+    }
   }
 ];
 
@@ -538,12 +549,22 @@ export function buildRCONCommand(toolName: string, args: Record<string, any>): s
   const tool = TOOLS[toolName];
   if (!tool) return ""; // Return empty for unknown tools (handled separately)
 
-  let cmd = tool.rcon;
+  // Single pass over the template via a regex replacer - immune to
+  // $-expansion (String.replace treats a literal replacement string specially)
+  // and to param values that themselves contain "{otherParam}".
+  const missing: string[] = [];
+  const cmd = tool.rcon.replace(/\{(\w+)\}/g, (_match, name: string) => {
+    const param = tool.params[name];
+    const value = args[name] ?? param?.default;
+    if (value === undefined) {
+      if (param?.required) missing.push(name);
+      return "";
+    }
+    return String(value);
+  });
 
-  // Replace placeholders with args or defaults
-  for (const [param, config] of Object.entries(tool.params)) {
-    const value = args[param] ?? config.default ?? "";
-    cmd = cmd.replace(`{${param}}`, String(value));
+  if (missing.length) {
+    throw new Error(`Missing required argument(s): ${missing.join(", ")}`);
   }
 
   // Clean up extra spaces
