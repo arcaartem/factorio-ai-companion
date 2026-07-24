@@ -54,7 +54,11 @@ commands.add_command("fac_building_remove", nil, function(cmd)
     local reach_err = u.check_reach(id, c, t.position)
     if reach_err then u.json_response(reach_err); return end
     if t.can_be_destroyed() then
-      c.entity.insert{name = name, count = 1}; t.destroy{raise_destroy = false}
+      -- only destroy once the companion has actually taken the item, else it is lost
+      if c.entity.insert{name = name, count = 1} < 1 then
+        u.json_response({id = id, error = "Inventory full", full = true}); return
+      end
+      t.destroy{raise_destroy = false}
       u.json_response({id = id, removed = true, entity = name})
     else u.json_response({id = id, error = "Cannot remove"}) end
   end)
@@ -156,7 +160,7 @@ commands.add_command("fac_building_empty", nil, function(cmd)
     end
     -- include neutral so crash-site wreckage and other unowned containers are reachable
     local es = c.entity.surface.find_entities_filtered{position = pos, radius = 5, force = {c.entity.force, "neutral"}}
-    local ext = 0
+    local ext, full = 0, false
     for _, e in ipairs(es) do
       if e.valid and e ~= c.entity then
         for _, it in ipairs({defines.inventory.chest, defines.inventory.furnace_result, defines.inventory.assembling_machine_output}) do
@@ -164,15 +168,19 @@ commands.add_command("fac_building_empty", nil, function(cmd)
           if inv then
             local av = inv.get_item_count(item)
             if av > 0 then
-              local rm = inv.remove{name = item, count = math.min(count - ext, av)}
-              if rm > 0 then c.entity.insert{name = item, count = rm}; ext = ext + rm end
+              -- insert first and remove only what the companion accepted, else the
+              -- shortfall is destroyed outright when its inventory is full
+              local want = math.min(count - ext, av)
+              local acc = c.entity.insert{name = item, count = want}
+              if acc > 0 then inv.remove{name = item, count = acc}; ext = ext + acc end
+              if acc < want then full = true; break end
             end
           end
         end
-        if ext >= count then break end
       end
+      if full or ext >= count then break end
     end
-    u.json_response({id = id, extracted = ext, item = item})
+    u.json_response({id = id, extracted = ext, item = item, full = full})
   end)
 end)
 
