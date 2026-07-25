@@ -104,6 +104,9 @@ local function request_path(cid, c, goal)
     q.last_path_tick = game.tick
   else
     q.status = "no_path"
+    -- Stamp the attempt even when the request never got made: the follow re-path backoff
+    -- keys off last_path_tick, and leaving it unset here would retry every single tick.
+    q.last_path_tick = game.tick
   end
 end
 
@@ -253,7 +256,16 @@ function M.tick_walk_queues()
     if need_path then
       if q.status == "stuck" or q.status == "no_path" then
         e.walking_state = {walking = false}
-        return false
+        -- Terminal for a plain move_to: it sits until an explicit re-issue, as documented.
+        -- A follow target must not latch though - losing the path for a moment (the player
+        -- rounds a wall, crosses water, a gate closes) would otherwise freeze the companion
+        -- forever, contradicting the promise above. Retry on the same backoff the drift
+        -- path uses, and hand the recovered queue a fresh stuck/busy budget.
+        if not q.follow_player then return false end
+        if (game.tick - (q.last_path_tick or 0)) < FOLLOW_REPATH_TICKS then return false end
+        q.stuck_retried = false
+        q.stuck_ticks = 0
+        q.busy_retries = 0
       end
       request_path(cid, c, q.target)
       return false
