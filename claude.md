@@ -68,12 +68,18 @@ local-rcon-password=factorio
 
 **Install mod:** Copy `factorio-mod/` → `%APPDATA%\Factorio\mods\ai-companion\`
 
-**Update mod:**
+**Update mod** (macOS — this machine; the upstream README's `/c/Users/lveil/...` Windows path does not exist here):
 ```bash
-# Windows command (use this, xcopy has path issues in bash)
-cp -r /c/Users/lveil/Desktop/Projects/factorio-ai-companion/factorio-mod/* /c/Users/lveil/AppData/Roaming/Factorio/mods/ai-companion/
+MODS=~/Library/Application\ Support/factorio/mods/ai-companion
+cp -r factorio-mod/* "$MODS/"
+diff -rq factorio-mod "$MODS"   # must print nothing
 ```
-Restart Factorio.
+Then main menu → Host Saved Game (control-stage files reload; no app restart — see Gotchas).
+
+**Always run that `diff` before any live test.** The deployed dir is the only code Factorio
+actually executes, and it has silently held a *partial* sync (2026-07-24: `building.lua` at HEAD
+while `queues.lua`/`init.lua`/`companion.lua` predated the fixes they were supposed to prove).
+`info.json`'s version is not evidence — it read `0.13.3` alongside a current `description`.
 
 ## Gotchas
 
@@ -94,4 +100,5 @@ Restart Factorio.
 
 - FLE (inspiration): `../factorio-learning-environment/`
 - Validation: `bun run scripts/validate-tools.ts` (53 tools = 53 Lua commands; also checks arity/argument order, not just names). CAVEAT: it covers the request side only — Lua *response shapes* and the hand-rolled command strings inside `src/skills/*.ts` are unchecked, and both have drifted before. Contract changes need a live in-game check, not just a green validator.
+- Lua has no test harness here, but `luac -p factorio-mod/commands/*.lua` (mise-provided) is a free syntax gate — neither the validator nor `bun test` parses Lua at all.
 - Lefthook runs validation + `bun test` on pre-commit
