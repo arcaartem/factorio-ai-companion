@@ -137,12 +137,14 @@ async function attack(
 
     const health = await getHealth();
     if (health && health.pct < 30) {
-      await exec(`/fac_action_attack_stop ${companionId}`);
+      // The stop response carries the round's authoritative count, including any kill
+      // landed since the last poll; totalKills is only as fresh as that poll.
+      const stopped = await exec(`/fac_action_attack_stop ${companionId}`);
       await say("Health low, retreating!");
       if (startPos) {
         await walkTo(startPos.x, startPos.y);
       }
-      return {kills: totalKills, retreated: true};
+      return {kills: stopped?.kills ?? totalKills, retreated: true};
     }
 
     await sleep(POLL_INTERVAL);

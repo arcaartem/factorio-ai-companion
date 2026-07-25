@@ -49,6 +49,9 @@ function M.init()
   storage.craft_queues = storage.craft_queues or {}
   storage.build_queues = storage.build_queues or {}
   storage.combat_queues = storage.combat_queues or {}
+  -- Outcome of the last finished combat round per companion. The queue is deleted on the
+  -- same tick the final kill is counted, so this is the only way a terminal poll can see it.
+  storage.combat_results = storage.combat_results or {}
 end
 
 -- ============ WALK ============
@@ -611,6 +614,10 @@ function M.start_combat(cid, target_pos)
     cooldown = 0,
     kills = 0
   }
+  -- kills is per-round, so drop the previous round's result: a poll on this round must not
+  -- be able to read a stale total from the last one.
+  storage.combat_results = storage.combat_results or {}
+  storage.combat_results[cid] = nil
 
   return {started = true, targets = #enemies}
 end
@@ -633,6 +640,11 @@ function M.tick_combat_queues()
 
       if #q.targets == 0 then
         c.entity.shooting_state = {state = defines.shooting.not_shooting}
+        -- The kill counted just above lands on the same tick this queue is torn down, so
+        -- without persisting it the final kill - the only kill, against a single enemy -
+        -- could never be read back.
+        storage.combat_results = storage.combat_results or {}
+        storage.combat_results[cid] = {kills = q.kills or 0, ended_tick = game.tick}
         return true
       end
       q.current = table.remove(q.targets, 1)
@@ -657,7 +669,11 @@ end
 
 function M.get_combat_status(cid)
   local q = storage.combat_queues[cid]
-  if not q then return {active = false} end
+  if not q then
+    -- Terminal poll: this is the branch combat_until actually reads its total from.
+    local last = (storage.combat_results or {})[cid]
+    return {active = false, kills = last and last.kills or 0, ended_tick = last and last.ended_tick or nil}
+  end
 
   local remaining = #q.targets
   if q.current and q.current.valid then remaining = remaining + 1 end
@@ -672,7 +688,7 @@ end
 
 function M.stop_combat(cid)
   local q = storage.combat_queues[cid]
-  if not q then return {stopped = false} end
+  if not q then return {stopped = false, kills = 0} end
 
   local c = valid_companion(cid)
   if c then
@@ -680,8 +696,14 @@ function M.stop_combat(cid)
     c.entity.walking_state = {walking = false}
   end
 
+  -- combat.lua's wrapper has always reported `result.kills or 0`; until now this returned
+  -- no kills at all, so an interrupted round (the low-health retreat) always read as zero.
+  local kills = q.kills or 0
+  storage.combat_results = storage.combat_results or {}
+  storage.combat_results[cid] = {kills = kills, ended_tick = game.tick}
+
   storage.combat_queues[cid] = nil
-  return {stopped = true}
+  return {stopped = true, kills = kills}
 end
 
 return M
