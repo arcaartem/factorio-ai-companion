@@ -18,6 +18,7 @@ interface RunningSkill {
   pid: number;
   skillName: string;
   startTime: number;
+  logPath: string;
 }
 const runningSkills = new Map<number, RunningSkill>();
 
@@ -34,7 +35,6 @@ const lastSkillResults = new Map<number, SkillRunResult>();
 export class FactorioMCPServer {
   private server: Server;
   private rcon: RCONClient;
-  private pollingInterval?: NodeJS.Timeout;
 
   constructor(rconConfig: { host: string; port: number; password: string }) {
     this.server = new Server(
@@ -74,28 +74,43 @@ export class FactorioMCPServer {
         };
       };
 
-      // Helper to stop a companion's running skill (TS + Lua)
-      const stopCompanionSkill = async (companionId: number): Promise<string | null> => {
+      // Helper to stop a companion's running skill (TS + Lua).
+      // stopWalk=false for move_to/move_follow: start_walk already cancels any existing
+      // request itself, and it answers a repeated same-target call with current progress
+      // (queues.lua:154-158). Sending /fac_move_stop first deletes the very queue that
+      // poll reads, so every poll restarted the pathfind instead of reporting progress.
+      const stopCompanionSkill = async (companionId: number, stopWalk: boolean): Promise<string | null> => {
         const skill = runningSkills.get(companionId);
 
-        // Always clear Lua queues
+        // Harvest/craft queues can exist with no TS process behind them (resource_mine and
+        // item_craft_start are plain tools), so clear those regardless of `skill`.
         await this.rcon.sendCommand(`/fac_resource_mine_stop ${companionId}`);
         await this.rcon.sendCommand(`/fac_item_craft_stop ${companionId}`);
-        await this.rcon.sendCommand(`/fac_move_stop ${companionId}`);
+        if (stopWalk) {
+          await this.rcon.sendCommand(`/fac_move_stop ${companionId}`);
+        }
 
         if (!skill) {
           return null; // No TS skill was running
         }
 
-        // Kill the TS process
+        // Kill the TS process. Record the outcome here rather than leaving it to the exit
+        // handler, which deliberately ignores a process it no longer tracks (see below).
+        runningSkills.delete(companionId);
+        let msg: string;
         try {
           process.kill(skill.pid);
-          runningSkills.delete(companionId);
-          return `Stopped ${skill.skillName} (pid ${skill.pid})`;
+          msg = `Stopped ${skill.skillName} (pid ${skill.pid})`;
         } catch (e) {
-          runningSkills.delete(companionId);
-          return `Process ${skill.pid} already dead`;
+          msg = `Process ${skill.pid} already dead`;
         }
+        lastSkillResults.set(companionId, {
+          skillName: skill.skillName,
+          exitCode: null, // killed, not self-terminated
+          endedAt: Date.now(),
+          logPath: skill.logPath
+        });
+        return msg;
       };
 
       // Tools that require stopping active skills before execution
@@ -103,12 +118,17 @@ export class FactorioMCPServer {
         'move_to', 'move_follow',
         'action_attack', 'action_flee', 'action_patrol', 'action_wololo'
       ];
+      // ...of which these supersede an existing walk on their own; the rest want it cleared.
+      const SELF_SUPERSEDING_MOVE_TOOLS = ['move_to', 'move_follow'];
 
       // Check if it's a regular RCON tool
       if (TOOLS[toolName]) {
         // Auto-stop skills for movement/action commands
         if (AUTO_STOP_TOOLS.includes(toolName) && args.companionId !== undefined) {
-          const stopMsg = await stopCompanionSkill(args.companionId as number);
+          const stopMsg = await stopCompanionSkill(
+            args.companionId as number,
+            !SELF_SUPERSEDING_MOVE_TOOLS.includes(toolName)
+          );
           if (stopMsg) {
             console.error(`[Auto-stop] ${stopMsg} for ${toolName}`);
           }
@@ -165,11 +185,18 @@ export class FactorioMCPServer {
         runningSkills.set(companionId, {
           pid: proc.pid!,
           skillName: toolName,
-          startTime: Date.now()
+          startTime: Date.now(),
+          logPath
         });
 
-        // Clean up when process exits
+        // Clean up when process exits. The guard matters: `exit` fires asynchronously, so a
+        // skill killed by stopCompanionSkill can emit it *after* a replacement skill has
+        // already registered for the same companion. Keyed on companionId alone that deletes
+        // the newcomer's entry — leaving a live process untracked, so the "already running"
+        // check below silently allows a second concurrent skill — and reports the dead
+        // skill's exit code as the companion's latest result.
         proc.on("exit", (code) => {
+          if (runningSkills.get(companionId)?.pid !== proc.pid) return;
           runningSkills.delete(companionId);
           lastSkillResults.set(companionId, {
             skillName: toolName,
@@ -266,7 +293,7 @@ export class FactorioMCPServer {
       // companion_stop - kill a running skill AND clear Lua queues
       if (toolName === "companion_stop") {
         const companionId = args.companionId as number;
-        const stopMsg = await stopCompanionSkill(companionId);
+        const stopMsg = await stopCompanionSkill(companionId, true);
 
         if (!stopMsg) {
           return {
@@ -308,40 +335,12 @@ export class FactorioMCPServer {
     });
   }
 
-  private async checkForMessages() {
-    try {
-      const response = await this.rcon.sendCommand("/fac_chat_get");
-
-      if (response.success && response.data) {
-        const messages = JSON.parse(response.data || "[]");
-
-        if (Array.isArray(messages) && messages.length > 0) {
-          messages.forEach((msg: { player: string; message: string; tick: number }) => {
-            this.server.notification({
-              method: "notifications/message",
-              params: {
-                level: "info",
-                logger: "factorio-companion",
-                data: msg,
-              },
-            });
-          });
-
-          console.error(`Sent ${messages.length} notification(s)`);
-        }
-      }
-    } catch (error) {
-      console.error("checkForMessages failed:", error instanceof Error ? error.message : error);
-    }
-  }
-
-  private startPolling() {
-    console.error("Starting message polling (every 3 seconds)...");
-
-    this.pollingInterval = setInterval(async () => {
-      await this.checkForMessages();
-    }, 3000);
-  }
+  // NOTE: this server deliberately does NOT poll /fac_chat_get. That command is a
+  // destructive drain, so a second poller does not observe messages - it steals them.
+  // This server used to drain every 3s alongside reactive-all.ts's 100ms loop, and each
+  // message went to whichever polled first; the ones this server won became MCP
+  // notifications that the documented orchestrator loop never reads, so they were simply
+  // lost. reactive-all.ts is the sole drainer and owns .fac-messages.jsonl.
 
   async start() {
     console.error("Starting Factorio MCP Server...");
@@ -351,14 +350,10 @@ export class FactorioMCPServer {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
     console.error("MCP server running on stdio");
-
-    this.startPolling();
+    console.error("Chat is drained by reactive-all.ts, not this server.");
   }
 
   async stop() {
-    if (this.pollingInterval) {
-      clearInterval(this.pollingInterval);
-    }
     await this.rcon.disconnect();
   }
 }
