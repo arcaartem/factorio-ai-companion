@@ -39,8 +39,13 @@ commands.add_command("fac_companion_spawn", nil, function(cmd)
       local color = u.get_companion_color(id)
       e.color = color
       storage.companions[id] = {entity = e, color = color, label = u.render_label(e, "#" .. id, color), spawned_tick = game.tick, realistic = false}
+      -- Take a gun/ammo from the player's main inventory if available - never conjured.
+      -- An unarmed companion is a valid outcome, not a spawn failure.
+      local arm = u.arm_from(e, p.get_main_inventory())
       game.print("[#" .. id .. " spawned]", u.print_color(color))
-      u.json_response({spawned = true, id = id})
+      local resp = {spawned = true, id = id, armed = arm.armed, weapon = arm.weapon, ammo = arm.ammo, ammo_count = arm.ammo_count or 0}
+      if not arm.armed then resp.arm_reason = arm.reason end
+      u.json_response(resp)
     else u.error_response("Failed to spawn") end
   end)
 end)
@@ -49,21 +54,11 @@ commands.add_command("fac_companion_disappear", nil, function(cmd)
   u.safe_command(function()
     local id, c = u.find_companion(cmd.parameter)
     if not id then u.error_response("Companion not found"); return end
-    local pos, surf = c.entity.position, c.entity.surface
+    -- Spill everything the companion is carrying - main inventory plus the gun/ammo it may
+    -- have been armed with at spawn - rather than destroying real player items.
     local dropped = {}
-    local inv = c.entity.get_inventory(defines.inventory.character_main)
-    if inv then
-      -- Factorio 2.0: get_contents() returns an array of {name, count, quality} records.
-      for _, item in pairs(inv.get_contents()) do
-        surf.spill_item_stack{
-          position = pos,
-          stack = {name = item.name, count = item.count, quality = item.quality},
-          enable_looted = true,
-          allow_belts = false
-        }
-        dropped[#dropped + 1] = {name = item.name, count = item.count}
-      end
-    end
+    for _, d in ipairs(u.spill_inventory(c.entity, defines.inventory.character_main)) do dropped[#dropped + 1] = d end
+    for _, d in ipairs(u.spill_equipment(c.entity)) do dropped[#dropped + 1] = d end
     if c.label and c.label.valid then c.label.destroy() end
     if storage.companion_markers and storage.companion_markers[id] then
       if storage.companion_markers[id].valid then storage.companion_markers[id].destroy() end
@@ -170,6 +165,11 @@ commands.add_command("fac_companion_stop_all", nil, function(cmd)
       stopped[#stopped + 1] = "build"
     end
     if storage.combat_queues and storage.combat_queues[id] then
+      -- Persist the round's kills before dropping the queue, else a stop_all mid-fight
+      -- silently discards the total (same fix as stop_combat/process_queue's on_drop).
+      local q = storage.combat_queues[id]
+      storage.combat_results = storage.combat_results or {}
+      storage.combat_results[id] = {kills = q.kills or 0, uncaused = q.uncaused or 0, ended_tick = game.tick}
       storage.combat_queues[id] = nil
       stopped[#stopped + 1] = "combat"
     end

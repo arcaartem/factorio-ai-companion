@@ -10,6 +10,9 @@ local BUILD_TICKS = 60
 local ATTACK_COOLDOWN = 15
 local ATTACK_RANGE = 6
 local MINING_RANGE = 5
+local UNCAUSED_DEATH_RADIUS = 20 -- bounds the q.uncaused diagnostic to queues whose companion is plausibly
+                                  -- involved in a given unattributed death, so one stray death doesn't
+                                  -- inflate the count on every OTHER active combat queue too (see handle_entity_died)
 
 -- Walk / pathfinding
 local WAYPOINT_DIST = 1.0        -- distance to switch to the next path waypoint
@@ -25,8 +28,11 @@ local function valid_companion(id)
   return c and c.entity and c.entity.valid and c
 end
 
--- Generic queue processor - eliminates repetition across all tick functions
-local function process_queue(queue_name, processor)
+-- Generic queue processor - eliminates repetition across all tick functions.
+-- on_drop(cid, q), if given, runs when the companion itself has become invalid (died,
+-- despawned) right before its queue entry is discarded - the combat queue uses this to
+-- persist the round's kills, which would otherwise vanish along with the queue.
+local function process_queue(queue_name, processor, on_drop)
   local queues = storage[queue_name]
   if not queues then return end
 
@@ -34,6 +40,7 @@ local function process_queue(queue_name, processor)
   for cid, q in pairs(queues) do
     local c = valid_companion(cid)
     if not c then
+      if on_drop then on_drop(cid, q) end
       to_remove[#to_remove + 1] = cid
     else
       local should_remove = processor(cid, q, c)
@@ -596,6 +603,12 @@ function M.start_combat(cid, target_pos)
   local c = valid_companion(cid)
   if not c then return {error = "Invalid companion"} end
 
+  -- Pick up whatever's already in the companion's own inventory (e.g. via item_pick /
+  -- building_empty since spawning) before failing - "use what you have" needs no new command.
+  u.arm_from(c.entity, c.entity.get_main_inventory())
+  if not u.equipped_gun(c.entity) then return {error = "No weapon equipped"} end
+  if u.loaded_ammo_count(c.entity) < 1 then return {error = "No ammo"} end
+
   local enemies = c.entity.surface.find_entities_filtered{
     position = target_pos,
     radius = 10,
@@ -612,7 +625,8 @@ function M.start_combat(cid, target_pos)
     targets = enemies,
     current = enemies[1],
     cooldown = 0,
-    kills = 0
+    kills = 0,
+    uncaused = 0
   }
   -- kills is per-round, so drop the previous round's result: a poll on this round must not
   -- be able to read a stale total from the last one.
@@ -620,6 +634,41 @@ function M.start_combat(cid, target_pos)
   storage.combat_results[cid] = nil
 
   return {started = true, targets = #enemies}
+end
+
+-- Companions credit kills by attribution (event.cause from on_entity_died), not by
+-- inferring "the current target slot went invalid" - that inference over-counted (any
+-- death reason credited the companion) and dropped every bystander kill in a cluster.
+function M.handle_entity_died(event)
+  storage.combat_queues = storage.combat_queues or {}
+  storage.companions = storage.companions or {}
+  local dead = event.entity
+  if not dead or not dead.valid then return end
+
+  local cause = event.cause
+  if cause and cause.valid then
+    for cid, q in pairs(storage.combat_queues) do
+      local c = u.get_companion(cid)
+      if c and c.entity == cause then
+        q.kills = (q.kills or 0) + 1
+        return
+      end
+    end
+  end
+
+  -- Diagnostic only, not a kill count: distinguishes "the companion genuinely didn't
+  -- kill it" from "event.cause isn't populated for character gun fire at all" - the one
+  -- API assumption that couldn't be verified without shipping this handler. Bounded by
+  -- distance so one unattributed death doesn't inflate this on every OTHER companion's
+  -- queue too - only a queue whose companion is plausibly nearby counts it.
+  if dead.force and dead.force.name == "enemy" then
+    for cid, q in pairs(storage.combat_queues) do
+      local c = u.get_companion(cid)
+      if c and c.entity and c.entity.valid and u.distance(dead.position, c.entity.position) <= UNCAUSED_DEATH_RADIUS then
+        q.uncaused = (q.uncaused or 0) + 1
+      end
+    end
+  end
 end
 
 function M.tick_combat_queues()
@@ -630,8 +679,9 @@ function M.tick_combat_queues()
     end
 
     if not q.current or not q.current.valid then
-      if q.current then q.kills = (q.kills or 0) + 1 end
-      -- Find next valid target (build new list to avoid mutation during iteration)
+      -- Kills are now credited by handle_entity_died via event.cause (see start_combat's
+      -- comment above it) - this pass only prunes dead entities from the pool and drives
+      -- round completion; it deliberately no longer increments q.kills itself.
       local valid_targets = {}
       for _, t in ipairs(q.targets) do
         if t.valid then valid_targets[#valid_targets + 1] = t end
@@ -640,11 +690,10 @@ function M.tick_combat_queues()
 
       if #q.targets == 0 then
         c.entity.shooting_state = {state = defines.shooting.not_shooting}
-        -- The kill counted just above lands on the same tick this queue is torn down, so
-        -- without persisting it the final kill - the only kill, against a single enemy -
-        -- could never be read back.
+        -- The round ends on this same tick the queue is torn down, so without persisting
+        -- here the final kill(s) could never be read back.
         storage.combat_results = storage.combat_results or {}
-        storage.combat_results[cid] = {kills = q.kills or 0, ended_tick = game.tick}
+        storage.combat_results[cid] = {kills = q.kills or 0, uncaused = q.uncaused or 0, ended_tick = game.tick}
         return true
       end
       q.current = table.remove(q.targets, 1)
@@ -664,6 +713,11 @@ function M.tick_combat_queues()
       if dir then c.entity.walking_state = {walking = true, direction = dir} end
     end
     return false
+  end, function(cid, q)
+    -- Companion died/vanished mid-fight: persist the round's kills before process_queue
+    -- drops the queue, else stop_combat/get_combat_status could never read them back.
+    storage.combat_results = storage.combat_results or {}
+    storage.combat_results[cid] = {kills = q.kills or 0, uncaused = q.uncaused or 0, ended_tick = game.tick}
   end)
 end
 
@@ -672,7 +726,12 @@ function M.get_combat_status(cid)
   if not q then
     -- Terminal poll: this is the branch combat_until actually reads its total from.
     local last = (storage.combat_results or {})[cid]
-    return {active = false, kills = last and last.kills or 0, ended_tick = last and last.ended_tick or nil}
+    return {
+      active = false,
+      kills = last and last.kills or 0,
+      ended_tick = last and last.ended_tick or nil,
+      uncaused_deaths = last and last.uncaused or 0
+    }
   end
 
   local remaining = #q.targets
@@ -682,13 +741,19 @@ function M.get_combat_status(cid)
     active = true,
     targets_remaining = remaining,
     current_target = q.current and q.current.valid and q.current.name or nil,
-    kills = q.kills or 0
+    kills = q.kills or 0,
+    uncaused_deaths = q.uncaused or 0
   }
 end
 
 function M.stop_combat(cid)
   local q = storage.combat_queues[cid]
-  if not q then return {stopped = false, kills = 0} end
+  if not q then
+    -- The queue may have completed (or dropped, see process_queue's on_drop) just before
+    -- this stop arrived - read the persisted total instead of hard-coding zero.
+    local last = (storage.combat_results or {})[cid]
+    return {stopped = false, kills = last and last.kills or 0, uncaused_deaths = last and last.uncaused or 0}
+  end
 
   local c = valid_companion(cid)
   if c then
@@ -699,11 +764,12 @@ function M.stop_combat(cid)
   -- combat.lua's wrapper has always reported `result.kills or 0`; until now this returned
   -- no kills at all, so an interrupted round (the low-health retreat) always read as zero.
   local kills = q.kills or 0
+  local uncaused = q.uncaused or 0
   storage.combat_results = storage.combat_results or {}
-  storage.combat_results[cid] = {kills = kills, ended_tick = game.tick}
+  storage.combat_results[cid] = {kills = kills, uncaused = uncaused, ended_tick = game.tick}
 
   storage.combat_queues[cid] = nil
-  return {stopped = true, kills = kills}
+  return {stopped = true, kills = kills, uncaused_deaths = uncaused}
 end
 
 return M

@@ -1,4 +1,25 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.14.0
+Date: 2026-07-26
+  Features:
+    - Companions are now armed on spawn by taking a gun and matching ammo from the player's
+      main inventory, if any is available - never conjured from nothing. An unarmed spawn
+      is a valid outcome (spawn response now reports armed/weapon/ammo/ammo_count/arm_reason)
+    - start_combat auto-equips from the companion's own inventory first (e.g. items picked
+      up via item_pick/building_empty), and now hard-fails with "No weapon equipped" or
+      "No ammo" instead of shooting with nothing
+  Changes:
+    - Combat kills are now credited by attribution (on_entity_died's event.cause) instead
+      of inferring a kill whenever the current target slot went invalid - the old inference
+      over-counted (any death reason) and dropped every bystander kill in a cluster.
+      get_combat_status/stop_combat now also report uncaused_deaths, a diagnostic-only
+      counter for enemy deaths not attributed to the companion
+    - A combat round's kill count now survives the companion dying mid-fight or being
+      stopped via companion_stop_all, instead of being discarded with the queue
+    - companion_disappear and /fac kill now spill the companion's gun and ammo (not just
+      main inventory) onto the ground instead of destroying them - companions carry the
+      player's real items now, not conjured freebies
+---------------------------------------------------------------------------------------------------
 Version: 0.13.4
 Date: 2026-07-23
   Bugfixes:

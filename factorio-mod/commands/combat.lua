@@ -73,7 +73,7 @@ commands.add_command("fac_action_attack_stop", nil, function(cmd)
     local id = u.find_companion(args[1])
     if not id then u.error_response("Companion not found"); return end
     local result = queues.stop_combat(id)
-    u.json_response({id = id, stopped = result.stopped, kills = result.kills or 0})
+    u.json_response({id = id, stopped = result.stopped, kills = result.kills or 0, uncaused_deaths = result.uncaused_deaths or 0})
   end)
 end)
 

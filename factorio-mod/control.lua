@@ -71,7 +71,14 @@ subcommands.kill = function(player, args)
         if storage.companion_markers[cid].valid then storage.companion_markers[cid].destroy() end
         storage.companion_markers[cid] = nil
       end
-      if c.entity and c.entity.valid then c.entity.destroy(); killed = killed + 1 end
+      if c.entity and c.entity.valid then
+        -- Companions carry the player's real gun/ammo/items now (see arm_from) - spill
+        -- them before destroying the entity, rather than destroying them outright.
+        u.spill_inventory(c.entity, defines.inventory.character_main)
+        u.spill_equipment(c.entity)
+        c.entity.destroy()
+        killed = killed + 1
+      end
       storage.companions[cid] = nil
     end
   end
@@ -175,6 +182,11 @@ end
 script.on_event(defines.events.on_script_path_request_finished, function(event)
   queues.handle_path_result(event)
 end)
+
+-- Kills are credited by attribution (event.cause), not by inferring "the current combat
+-- target slot went invalid" - see queues.handle_entity_died.
+script.on_event(defines.events.on_entity_died, function(event) queues.handle_entity_died(event) end,
+  {{filter = "type", type = "unit"}, {filter = "type", type = "unit-spawner"}, {filter = "type", type = "turret"}})
 
 script.on_nth_tick(5, function(ev)
   if ev.tick % 1800 == 0 then cleanup_messages() end

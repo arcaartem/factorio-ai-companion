@@ -149,4 +149,155 @@ function M.render_label(entity, text, color)
   }
 end
 
+-- ============ ARMING ============
+-- Companions may only ever TAKE items that already exist in the world (a source inventory
+-- passed in by the caller) - never conjured. See building.lua's insert-first idiom: an item
+-- is only removed from the source once the target inventory has confirmed it accepted it.
+
+local GUN_PREFERENCE = {"submachine-gun", "combat-shotgun", "shotgun", "pistol"}
+
+-- Returns slot_index, gun_item_name for the first equipped gun slot, else nil.
+function M.equipped_gun(entity)
+  local inv = entity.get_inventory(defines.inventory.character_guns)
+  if not inv then return nil end
+  for i = 1, #inv do
+    if inv[i].valid_for_read then return i, inv[i].name end
+  end
+  return nil
+end
+
+-- Returns slot_index, ammo_item_name for the first loaded ammo slot, else nil.
+local function first_loaded_ammo(entity)
+  local inv = entity.get_inventory(defines.inventory.character_ammo)
+  if not inv then return nil end
+  for i = 1, #inv do
+    if inv[i].valid_for_read then return i, inv[i].name end
+  end
+  return nil
+end
+
+-- Total count across all loaded character_ammo slots.
+function M.loaded_ammo_count(entity)
+  local inv = entity.get_inventory(defines.inventory.character_ammo)
+  if not inv then return 0 end
+  local total = 0
+  for i = 1, #inv do
+    if inv[i].valid_for_read then total = total + inv[i].count end
+  end
+  return total
+end
+
+-- gun's compatible ammo categories as a set, e.g. {bullet = true}. get_ammo_type() returns
+-- nil on ammo item prototypes here, so category matching must go through these two
+-- prototype fields, NOT can_insert (which does not encode gun/ammo compatibility).
+local function ammo_categories_for(gun_name)
+  local proto = prototypes.item[gun_name]
+  local cats = proto and proto.attack_parameters and proto.attack_parameters.ammo_categories
+  local set = {}
+  if cats then for _, cat in ipairs(cats) do set[cat] = true end end
+  return set
+end
+
+local function find_matching_ammo(source_inv, cat_set)
+  for _, item in ipairs(source_inv.get_contents()) do
+    local proto = prototypes.item[item.name]
+    if proto and proto.type == "ammo" and proto.ammo_category and cat_set[proto.ammo_category.name] then
+      return item.name
+    end
+  end
+  return nil
+end
+
+-- Arms entity from source_inv: equips a gun (if not already equipped) and loads matching
+-- ammo, taking only items source_inv already has. Returns
+-- {armed, weapon, ammo, ammo_count, reason} describing the entity's resulting state.
+function M.arm_from(entity, source_inv)
+  local guns = entity.get_inventory(defines.inventory.character_guns)
+  local ammo_inv = entity.get_inventory(defines.inventory.character_ammo)
+  if not guns or not ammo_inv or not source_inv then
+    return {armed = false, ammo_count = 0, reason = "no gun available"}
+  end
+
+  local gun_slot, gun_name = M.equipped_gun(entity)
+
+  if not gun_name then
+    -- Candidate order: preference list first, then any other gun-type item present.
+    local candidates, seen = {}, {}
+    for _, g in ipairs(GUN_PREFERENCE) do candidates[#candidates + 1] = g; seen[g] = true end
+    for _, item in ipairs(source_inv.get_contents()) do
+      if not seen[item.name] then
+        local proto = prototypes.item[item.name]
+        if proto and proto.type == "gun" then candidates[#candidates + 1] = item.name; seen[item.name] = true end
+      end
+    end
+
+    -- A gun is only eligible if source_inv also has matching ammo for it - otherwise an
+    -- SMG with no ammo would win over a pistol the companion could actually fire.
+    for _, g in ipairs(candidates) do
+      if source_inv.get_item_count(g) > 0 then
+        local cat_set = ammo_categories_for(g)
+        if next(cat_set) and find_matching_ammo(source_inv, cat_set) then
+          gun_name = g
+          break
+        end
+      end
+    end
+
+    if not gun_name then return {armed = false, ammo_count = 0, reason = "no gun available"} end
+
+    local ins = guns.insert{name = gun_name, count = 1}
+    if ins < 1 then return {armed = false, ammo_count = 0, reason = "no gun available"} end
+    source_inv.remove{name = gun_name, count = ins}
+    gun_slot = M.equipped_gun(entity)
+  end
+
+  local cat_set = ammo_categories_for(gun_name)
+  local ammo_name = find_matching_ammo(source_inv, cat_set)
+  if ammo_name then
+    local available = source_inv.get_item_count(ammo_name)
+    local stack_size = prototypes.item[ammo_name].stack_size or available
+    local want = math.min(available, stack_size)
+    local ins_ammo = ammo_inv.insert{name = ammo_name, count = want}
+    if ins_ammo > 0 then source_inv.remove{name = ammo_name, count = ins_ammo} end
+  end
+
+  if gun_slot then entity.selected_gun_index = gun_slot end
+
+  local final_ammo_count = M.loaded_ammo_count(entity)
+  if final_ammo_count < 1 then
+    return {armed = false, weapon = gun_name, ammo_count = 0, reason = "no ammo for " .. gun_name}
+  end
+  local _, final_ammo_name = first_loaded_ammo(entity)
+  return {armed = true, weapon = gun_name, ammo = final_ammo_name, ammo_count = final_ammo_count}
+end
+
+-- Spills one inventory's full contents onto the ground - the disappear/kill idiom for
+-- returning items the companion held rather than destroying them.
+function M.spill_inventory(entity, inv_type)
+  local dropped = {}
+  local inv = entity.get_inventory(inv_type)
+  if inv then
+    local pos, surf = entity.position, entity.surface
+    for _, item in pairs(inv.get_contents()) do
+      surf.spill_item_stack{
+        position = pos,
+        stack = {name = item.name, count = item.count, quality = item.quality},
+        enable_looted = true,
+        allow_belts = false
+      }
+      dropped[#dropped + 1] = {name = item.name, count = item.count}
+    end
+  end
+  return dropped
+end
+
+-- Companions now carry the player's real gun/ammo (see arm_from) - despawn paths must
+-- spill these too, or destroying/disappearing a companion destroys real player items.
+function M.spill_equipment(entity)
+  local dropped = {}
+  for _, d in ipairs(M.spill_inventory(entity, defines.inventory.character_guns)) do dropped[#dropped + 1] = d end
+  for _, d in ipairs(M.spill_inventory(entity, defines.inventory.character_ammo)) do dropped[#dropped + 1] = d end
+  return dropped
+end
+
 return M
