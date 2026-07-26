@@ -177,6 +177,9 @@ commands.add_command("fac_companion_stop_all", nil, function(cmd)
       stopped[#stopped + 1] = "walk"
     end
     c.entity.walking_state = {walking = false}
+    -- Without this, a stop_all issued mid-harvest leaves mining_state.mining true with no
+    -- queue behind it - nothing left in the mod would ever stop the companion mining forever.
+    c.entity.mining_state = {mining = false}
     u.json_response({id = id, stopped = stopped})
   end)
 end)

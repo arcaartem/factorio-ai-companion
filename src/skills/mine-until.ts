@@ -75,10 +75,16 @@ async function findNearest(): Promise<{position: {x: number, y: number}, distanc
 }
 
 async function walkTo(x: number, y: number): Promise<boolean> {
-  await exec(`/fac_move_to ${companionId} ${x} ${y}`);
-
   const startTime = Date.now();
   while (Date.now() - startTime < WALKING_TIMEOUT) {
+    // Calling /fac_move_to again with the same target is the documented idempotent poll
+    // (factorio-mod/commands/move.lua) - it also reports active:false once the walk queue
+    // has cleared itself, which happens at the mod's ARRIVE_DIST (1.5), not our own
+    // ARRIVAL_THRESHOLD - relying on distance alone left a companion parked between the two
+    // thresholds with no queue behind it, spinning here for the full timeout (probed live).
+    const result = await exec(`/fac_move_to ${companionId} ${x} ${y}`);
+    if (result?.active === false) return true;
+
     const pos = await getPosition();
     if (!pos) break;
 
@@ -113,19 +119,22 @@ async function waitForMiningComplete(): Promise<number> {
 
   while (Date.now() - startTime < MINING_TIMEOUT) {
     const status = await exec(`/fac_resource_mine_status ${companionId}`);
-    lastStatus = status?.status;
 
     if (!status?.status?.active) {
-      // Mining finished
-      return lastStatus?.harvested || 0;
+      // Mining finished. The terminal status now carries its own harvested count (the mod
+      // records it at the point the queue self-terminates) - prefer that, falling back to the
+      // last ACTIVE poll's reading only if it's somehow missing.
+      return status?.status?.harvested ?? lastStatus?.harvested ?? 0;
     }
 
+    lastStatus = status?.status;
     await sleep(POLL_INTERVAL);
   }
 
-  // Timeout - stop mining
-  await exec(`/fac_resource_mine_stop ${companionId}`);
-  return lastStatus?.harvested || 0;
+  // Timeout - stop mining and use the authoritative harvested count the stop response
+  // carries, rather than the last poll's (potentially stale) status.
+  const stopResult = await exec(`/fac_resource_mine_stop ${companionId}`);
+  return stopResult?.harvested ?? lastStatus?.harvested ?? 0;
 }
 
 

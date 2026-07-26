@@ -1,4 +1,34 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.16.0
+Date: 2026-07-26
+  Bugfixes:
+    - Fixed the harvest queue pinning the companion in place forever: the engine reverts
+      walking_state every tick while mining_state.mining is true, so a walk/combat queue
+      trying to move the companion could never actually move it. The harvest tick now yields
+      to an actively-moving walk/combat queue instead of fighting it, and re-asserts mining
+      once movement stops
+    - Fixed harvested count staying at 0 forever: mining_state.mining stays true for as long
+      as the ore tile has ore left (it's a per-amount decrement, not a per-ore event), so the
+      old "mining stopped -> count" guard never ran. Inventory deltas are now counted every
+      tick instead
+    - Added a 15s stall-guard timeout to the harvest queue so it can never hang indefinitely
+      even if the above two paths are both blocked
+    - start_mining_next now skips pool entities beyond resource_reach_distance - the pool is
+      seeded from a wider radius-3 search than the engine's actual mining reach (2.7)
+    - companion_stop_all now also clears mining_state, not just the queue and walking_state
+    - resource_mine_status now reports a finished queue's harvested/target/reason instead of a
+      bare {active=false}. The queue is deleted on the same tick its final ore is counted, so
+      the terminal poll previously had no way to read the outcome at all - which made
+      mine-until's success path return 0 even once counting itself was fixed
+    - fac_resource_mine now propagates start_harvest's error instead of always reporting
+      mining:true/status:"started"
+  Changes:
+    - mine-until's walkTo now also treats the walk queue reporting active:false as arrival,
+      not just a hard-coded distance check - a companion could land between the two
+      thresholds and spin for the full walk timeout with no queue behind it
+    - mine-until's mining timeout path now uses the harvested count from the stop response
+      instead of the last (potentially stale) status poll
+---------------------------------------------------------------------------------------------------
 Version: 0.15.0
 Date: 2026-07-26
   Changes:

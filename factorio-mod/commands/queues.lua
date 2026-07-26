@@ -9,6 +9,9 @@ local MIN_ACTION_TICKS = 30
 local BUILD_TICKS = 60
 local ATTACK_COOLDOWN = 15
 local ATTACK_RANGE = 6
+local HARVEST_STALL_TICKS = 900 -- 15s with no harvested-count progress = give up (last-resort
+                                 -- exit; the reach/movement-yield paths can legitimately block
+                                 -- forever, e.g. a latched "no_path" walk queue)
 local UNCAUSED_DEATH_RADIUS = 20 -- bounds the q.uncaused diagnostic to queues whose companion is plausibly
                                   -- involved in a given unattributed death, so one stray death doesn't
                                   -- inflate the count on every OTHER active combat queue too (see handle_entity_died)
@@ -330,6 +333,19 @@ end
 
 -- ============ HARVEST ============
 
+-- Terminates a harvest queue and records its outcome so a poll arriving AFTER the queue is
+-- gone (M.get_harvest_status finding storage.harvest_queues[cid] == nil) can still read the
+-- final harvested count and why it stopped - the queue itself is deleted by the caller
+-- (process_queue's to_remove, or M.stop_harvest directly), not here.
+local function finish_harvest(cid, q, c, reason)
+  c.entity.mining_state = {mining = false}
+  -- Nil-guard: control-stage reload does not run on_configuration_changed, so a save from
+  -- before this field existed never gets it from init_storage.
+  storage.harvest_results = storage.harvest_results or {}
+  storage.harvest_results[cid] = {harvested = q.harvested, target = q.target, reason = reason, tick = game.tick}
+  return true
+end
+
 function M.start_harvest(cid, position, target_count, resource_name)
   local c = valid_companion(cid)
   if not c then return {error = "Invalid companion"} end
@@ -353,6 +369,10 @@ function M.start_harvest(cid, position, target_count, resource_name)
     current = nil,
     resource_name = resource_name
   }
+  -- Drop any stale result from a previous run - a poll on this new run must never be able to
+  -- read a leftover outcome that belongs to the last one.
+  storage.harvest_results = storage.harvest_results or {}
+  storage.harvest_results[cid] = nil
 
   M.start_mining_next(cid)
   -- Set inv_snapshot immediately after starting mining
@@ -370,9 +390,13 @@ function M.start_mining_next(cid)
     return false
   end
 
+  -- start_harvest seeds the pool from a radius-3 search around the target position, but the
+  -- engine's own resource reach is only resource_reach_distance (2.7) - an entity beyond that
+  -- would sit in mining_state forever without ever actually mining (see tick_harvest_queues).
+  local reach = c.entity.resource_reach_distance or 10
   while #q.entities > 0 do
     local entity = table.remove(q.entities, 1)
-    if entity and entity.valid then
+    if entity and entity.valid and u.distance(entity.position, c.entity.position) <= reach then
       c.entity.update_selected_entity(entity.position)
       c.entity.mining_state = {mining = true, position = entity.position}
       q.current = {
@@ -388,59 +412,92 @@ end
 
 function M.tick_harvest_queues()
   process_queue("harvest_queues", function(cid, q, c)
+    -- Nil-guard: a queue persisted from a save that predates this field never gets it from
+    -- init_storage (control-stage reload does not run on_configuration_changed).
+    q.last_progress_tick = q.last_progress_tick or game.tick
+
     -- Target reached
     if q.harvested >= q.target then
-      c.entity.mining_state = {mining = false}
-      return true
+      return finish_harvest(cid, q, c, "target_reached")
     end
 
     -- Too far from mining area (reach enforcement is always on, see check_reach)
     if u.check_reach(cid, c, q.position, "resource") then
-      c.entity.mining_state = {mining = false}
       u.log_error("harvest aborted: too far", "companion " .. cid)
-      return true
+      return finish_harvest(cid, q, c, "too_far")
+    end
+
+    -- The engine refuses to move a character whose mining_state.mining is true - it silently
+    -- reverts walking_state every tick instead. Pause mining (not the queue) whenever a walk
+    -- or combat queue is actively trying to move the companion, or the two fight forever.
+    -- "no_path"/"stuck" are latched terminal states though: yielding to those would just swap
+    -- one permanent deadlock for another, so they don't count as "moving".
+    local walk_q = storage.walking_queues[cid]
+    local walk_moving = walk_q and (walk_q.status == "requesting" or walk_q.status == "walking")
+    local combat_q = storage.combat_queues and storage.combat_queues[cid]
+    local combat_moving = combat_q and combat_q.current and combat_q.current.valid
+      and (combat_q.cooldown or 0) <= 0
+      and u.distance(c.entity.position, combat_q.current.position) > ATTACK_RANGE
+    if walk_moving or combat_moving then
+      if c.entity.mining_state and c.entity.mining_state.mining then
+        c.entity.mining_state = {mining = false}
+      end
+      return false
     end
 
     -- Start mining first resource
     if not q.current then
       if not M.start_mining_next(cid) then
-        c.entity.mining_state = {mining = false}
-        return true
+        return finish_harvest(cid, q, c, "pool_empty")
       end
       q.inv_snapshot = u.contents_to_map(c.entity.get_main_inventory().get_contents())
       return false
     end
 
-    local current = q.current
+    -- Hot-reload guard: an old save may have persisted the pre-2.0 array-shaped snapshot.
+    if type(q.inv_snapshot[1]) == "table" then
+      q.inv_snapshot = u.contents_to_map(q.inv_snapshot)
+    end
 
-    -- HYBRID: Let Factorio mine natively, monitor mining_state
-    -- When mining stops (entity depleted or finished), count inventory and move to next
-    if not c.entity.mining_state or not c.entity.mining_state.mining then
-      -- Mining stopped - count what we got
-      -- Hot-reload guard: an old save may have persisted the pre-2.0 array-shaped snapshot.
-      if type(q.inv_snapshot[1]) == "table" then
-        q.inv_snapshot = u.contents_to_map(q.inv_snapshot)
-      end
-      local inv_after = u.contents_to_map(c.entity.get_main_inventory().get_contents())
-      local added = 0
-      for name, count in pairs(inv_after) do
-        added = added + math.max(0, count - (q.inv_snapshot[name] or 0))
-      end
-      q.harvested = q.harvested + added
+    -- Count every tick, unconditionally: mining_state.mining stays true for as long as the
+    -- ore tile still has ore (the resource entity just decrements `amount`, never gets
+    -- consumed per ore), so a "mining stopped" guard here would never fire and harvested
+    -- would stay 0 forever while the inventory kept rising underneath it.
+    local inv_after = u.contents_to_map(c.entity.get_main_inventory().get_contents())
+    local added = 0
+    for name, count in pairs(inv_after) do
+      added = added + math.max(0, count - (q.inv_snapshot[name] or 0))
+    end
+    q.harvested = q.harvested + added
+    q.inv_snapshot = inv_after
+    if added > 0 then q.last_progress_tick = game.tick end
 
-      -- Check if target reached
-      if q.harvested >= q.target then
-        c.entity.mining_state = {mining = false}
-        return true
-      end
+    if q.harvested >= q.target then
+      return finish_harvest(cid, q, c, "target_reached")
+    end
 
-      -- Move to next resource
+    if not q.current.entity.valid then
+      -- Tile depleted and destroyed - move to next resource
       q.current = nil
       if not M.start_mining_next(cid) then
-        c.entity.mining_state = {mining = false}
-        return true
+        return finish_harvest(cid, q, c, "pool_empty")
       end
       q.inv_snapshot = u.contents_to_map(c.entity.get_main_inventory().get_contents())
+    elseif not c.entity.mining_state or not c.entity.mining_state.mining then
+      -- Entity is still valid but the engine isn't mining it (e.g. resuming after a
+      -- movement-yield above) - re-assert on the same entity rather than discarding a
+      -- partly-mined tile.
+      local entity = q.current.entity
+      c.entity.update_selected_entity(entity.position)
+      c.entity.mining_state = {mining = true, position = entity.position}
+    end
+
+    -- Stall guard: every other exit above requires either reach or movement, both of which
+    -- can be legitimately blocked forever - this is the last-resort timeout that guarantees
+    -- termination.
+    if game.tick - q.last_progress_tick >= HARVEST_STALL_TICKS then
+      u.log_error("harvest stalled: no progress for " .. HARVEST_STALL_TICKS .. " ticks", "companion " .. cid)
+      return finish_harvest(cid, q, c, "stalled")
     end
 
     return false
@@ -449,7 +506,15 @@ end
 
 function M.get_harvest_status(cid)
   local q = storage.harvest_queues[cid]
-  if not q then return {active = false} end
+  if not q then
+    -- The queue is gone (self-terminated or stopped) - the only way a poll arriving after
+    -- that can still see the final count is the outcome finish_harvest recorded.
+    local last = (storage.harvest_results or {})[cid]
+    if last then
+      return {active = false, harvested = last.harvested, target = last.target, reason = last.reason}
+    end
+    return {active = false}
+  end
   return {
     active = true,
     harvested = q.harvested,
@@ -463,10 +528,10 @@ function M.stop_harvest(cid)
   local q = storage.harvest_queues[cid]
   if not q then return {stopped = false} end
 
-  local c = valid_companion(cid)
-  if c then c.entity.mining_state = {mining = false} end
-
   local harvested = q.harvested
+  local c = valid_companion(cid)
+  if c then finish_harvest(cid, q, c, "stopped") end
+
   storage.harvest_queues[cid] = nil
   return {stopped = true, harvested = harvested}
 end

@@ -44,10 +44,13 @@ commands.add_command("fac_resource_mine", nil, function(cmd)
     if reach_err then u.json_response(reach_err); return end
     -- Start realistic mining via queue system (with optional resource filter)
     local result = queues.start_harvest(id, tpos, count, resource_name)
-    if result then
-      u.json_response({id = id, mining = true, target = count, entities = result.entities or 0, resource = resource_name, status = "started"})
+    -- start_harvest always returns a table, including on its failure paths (e.g. "No
+    -- resource") - reporting the hardcoded success shape regardless made a failed start
+    -- look identical to a started one to callers gating on mining === true.
+    if result.error then
+      u.json_response({id = id, error = result.error})
     else
-      u.json_response({id = id, error = "Failed to start mining"})
+      u.json_response({id = id, mining = true, target = count, entities = result.entities or 0, resource = resource_name, status = "started"})
     end
   end)
 end)
