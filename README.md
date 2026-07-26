@@ -41,7 +41,7 @@ Orchestrating agent (Claude Code)
   `/fac_chat_get` for all companions, prints unread messages as a JSON array,
   appends every message to `.fac-messages.jsonl` as a durable audit log (the
   drain is destructive on the Lua side, so this file is the record), and
-  exits once there's something to report. See `claude.md` for how the
+  exits once there's something to report. See `CLAUDE.md` for how the
   orchestrator drives this loop.
 - **Lua mod** (`factorio-mod/commands/`) — implements the `fac_*` commands.
   Instant actions run inline; multi-tick actions (harvest, craft, build,
@@ -89,7 +89,7 @@ Lefthook runs both on pre-commit.
 
 For how the orchestrating agent should actually run companions (the reactive
 loop pattern, MCP tool categories, gotchas like RCON idle-socket behavior and
-mod hot-reload), see `claude.md` — that's the operational reference, kept in
+mod hot-reload), see `CLAUDE.md` — that's the operational reference, kept in
 sync with the code it documents.
 
 ## Credits
