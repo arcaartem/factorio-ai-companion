@@ -68,7 +68,13 @@ local-rcon-password=factorio
 
 **Install mod:** Copy `factorio-mod/` → `%APPDATA%\Factorio\mods\ai-companion\`
 
-**Update mod** (macOS — this machine; the upstream README's `/c/Users/lveil/...` Windows path does not exist here):
+**Update mod + verify — the normal loop is one command, with no human step:**
+```bash
+bun run scripts/smoke/test-server.ts t034      # deploy, fresh server, run suite, tear down
+```
+See "Preferred loop" below for what it does and its one limitation.
+
+**Manual path** (needed only for the combat suites, which require a connected client; macOS — this machine, the upstream README's `/c/Users/lveil/...` Windows path does not exist here):
 ```bash
 MODS=~/Library/Application\ Support/factorio/mods/ai-companion
 cp -r factorio-mod/* "$MODS/"
