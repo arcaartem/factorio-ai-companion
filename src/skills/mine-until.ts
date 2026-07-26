@@ -9,9 +9,10 @@ const WALKING_TIMEOUT = 60000;
 // Engine's real resource_reach_distance is 2.7 (live-probed); stay safely inside it
 // so a mine request isn't refused with "Too far" right after we decide not to walk.
 const RESOURCE_REACH = 2.5;
-// fac_resource_nearest floors its returned coordinates (factorio-mod/commands/resource.lua:89),
-// which can stack up to ~1.4 tiles of rounding error on top of the arrival check below - keep
-// this tight so we actually land within the real 2.7-tile reach, not just "close enough".
+// fac_resource_nearest returns exact entity coordinates as of mod 0.17.0 (it used to floor
+// them, stacking ~0.71 tiles of error onto the 2.7-tile reach budget). Kept tight anyway: the
+// mod's own walk queue declares arrival at ARRIVE_DIST 1.5, so anything looser than this would
+// hand mining a target it cannot actually reach.
 const ARRIVAL_THRESHOLD = 1.0;
 
 const companionId = parseInt(process.argv[2]);

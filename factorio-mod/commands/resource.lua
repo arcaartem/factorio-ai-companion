@@ -84,11 +84,11 @@ commands.add_command("fac_resource_nearest", nil, function(cmd)
     if not id then u.error_response("Companion not found"); return end
     local name = normalize[args[2]] or args[2]
     local pos = c.entity.position
-    local area = {{pos.x - 200, pos.y - 200}, {pos.x + 200, pos.y + 200}}
-    local es = c.entity.surface.find_entities_filtered{area = area, name = name, limit = 100}
-    if #es == 0 then u.json_response({id = id, error = "Not found"}); return end
-    local closest, min = nil, math.huge
-    for _, e in ipairs(es) do local d = u.distance(e.position, pos); if d < min then min, closest = d, e end end
-    u.json_response({id = id, resource = closest.name, position = {x = math.floor(closest.position.x), y = math.floor(closest.position.y)}, distance = math.floor(min), amount = closest.amount})
+    local closest, min = u.find_nearest(c.entity.surface, pos, {name = name})
+    if not closest then u.json_response({id = id, error = "Not found"}); return end
+    -- Exact position, not math.floor'd. Ore sits at tile CENTRES (x.5, y.5), so flooring moved
+    -- the reported target ~0.71 tiles off the entity - which callers then spend out of the
+    -- engine's 2.7-tile resource_reach_distance before they have walked anywhere.
+    u.json_response({id = id, resource = closest.name, position = {x = closest.position.x, y = closest.position.y}, distance = min, amount = closest.amount})
   end)
 end)

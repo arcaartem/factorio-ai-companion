@@ -91,6 +91,69 @@ function M.distance(a, b)
   return math.sqrt((a.x - b.x)^2 + (a.y - b.y)^2)
 end
 
+-- ============ NEAREST SEARCH ============
+-- find_entities_filtered's `limit` truncates in the engine's own chunk order, which carries no
+-- distance ordering at all - so scanning a wide area with a limit and then picking the minimum
+-- yields "nearest of an arbitrary sample", not "nearest". Live-probed returning iron-ore at
+-- distance 155 while iron-ore sat at 85.5 from the same position.
+--
+-- An UNLIMITED circular search is complete by construction: if it returns anything, the closest
+-- member is the true global nearest, because everything omitted lies outside the circle and so
+-- is farther than the circle's own radius. Growing the radius from small keeps the common case
+-- (the resource is right there) cheap, and only pays for a wide scan when the surroundings
+-- genuinely are empty - which is exactly when the wide scan returns few entities.
+M.SEARCH_RADII = {8, 16, 32, 64, 128, 200}
+M.SEARCH_MAX_RADIUS = M.SEARCH_RADII[#M.SEARCH_RADII]
+
+local function closest_of(items, pos, position_of)
+  local best, min = nil, math.huge
+  for _, item in ipairs(items) do
+    local d = M.distance(position_of(item), pos)
+    if d < min then min, best = d, item end
+  end
+  return best, min
+end
+
+local function entity_position(e) return e.position end
+local function tile_position(t) return t.position end
+
+-- filter is a find_entities_filtered table WITHOUT position/radius, e.g. {name = "iron-ore"}
+-- or {type = "tree"}. Returns entity, distance - or nil when nothing matches within
+-- SEARCH_MAX_RADIUS.
+function M.find_nearest(surface, pos, filter)
+  for _, radius in ipairs(M.SEARCH_RADII) do
+    local search = {position = pos, radius = radius}
+    for k, v in pairs(filter) do search[k] = v end
+    local es = surface.find_entities_filtered(search)
+    if #es > 0 then
+      local best, min = closest_of(es, pos, entity_position)
+      -- radius selection is bounding-box based, so an entity whose CENTRE sits just outside
+      -- the radius can still come back. When that happens the circle we searched did not cover
+      -- everything closer than our candidate, so widen once to close the gap.
+      if min > radius then
+        search.radius = min
+        local wider = surface.find_entities_filtered(search)
+        if #wider > 0 then best, min = closest_of(wider, pos, entity_position) end
+      end
+      return best, min
+    end
+  end
+  return nil, nil
+end
+
+-- Tile equivalent (water). Returns the tile's position (LuaTile has no stable handle worth
+-- returning) and its distance, or nil.
+function M.find_nearest_tile(surface, pos, names)
+  for _, radius in ipairs(M.SEARCH_RADII) do
+    local tiles = surface.find_tiles_filtered{position = pos, radius = radius, name = names}
+    if #tiles > 0 then
+      local best, min = closest_of(tiles, pos, tile_position)
+      return best.position, min
+    end
+  end
+  return nil, nil
+end
+
 -- Player-parity reach check. kind selects which of the companion's reach
 -- properties (all read-only on LuaControl, inherited by character LuaEntity)
 -- applies: "resource" for mining, "item" for ground item pickup, anything

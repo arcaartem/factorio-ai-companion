@@ -1,4 +1,25 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.17.0
+Date: 2026-07-26
+  Bugfixes:
+    - resource_nearest and world_nearest now actually return the NEAREST match. Both scanned a
+      +/-200 square with limit=100 and then picked the minimum from whatever came back, but
+      find_entities_filtered's limit truncates in the engine's chunk order with no distance
+      ordering - so the true nearest could be excluded from the sample outright. Probed live
+      returning iron-ore at distance 155 while iron-ore sat at 85.5. Both now grow an unlimited
+      circular search (8 -> 16 -> 32 -> 64 -> 128 -> 200), which is complete by construction:
+      whatever the first non-empty circle contains, everything omitted is farther than its
+      radius. The near case stays cheap; only genuinely empty surroundings pay for a wide scan
+    - resource_nearest no longer floors the coordinates it returns. Ore sits at tile centres
+      (x.5, y.5), so flooring reported a point ~0.71 tiles off the actual entity - spent
+      straight out of the engine's 2.7-tile resource_reach_distance before the caller had
+      walked anywhere. Reported distance is likewise no longer floored, which had it
+      under-report and skip a needed walk
+  Changes:
+    - world_nearest's water branch searches the same expanding circle as the entity branches
+      instead of a limited square, and reports an unfloored distance
+
+---------------------------------------------------------------------------------------------------
 Version: 0.16.0
 Date: 2026-07-26
   Bugfixes:
