@@ -32,10 +32,16 @@
 // The mod's own reported total is cross-checked against BOTH. Three
 // independent numbers agreeing is real verification; one is not.
 //
-// Also walks the companion in via move_to instead of teleporting: teleporting
-// drops it inside a group and triggers instant multi-aggro, which is what
-// produced the "retreated" outcome that spoiled the previous multi-round
-// attempt. Walking lets it engage at the fringe of a group instead.
+// FIX 3 (this pass): B1/B2/B3 now run in a controlled arena instead of hunting the live map for
+// a natural cluster - teleport the companion to a spot verified clear of spawners/turrets/worms,
+// then create_entity the exact enemies the scenario needs at a known, fixed distance. Test-side
+// spawning/teleporting is explicitly fine (cleared with the task owner); only the MOD's own
+// gameplay code is off-limits for conjuring/teleporting. This removes the hazard the previous
+// version of this comment warned about - teleporting a companion INTO an existing, unknown-size
+// natural cluster triggered instant multi-aggro and drove the "retreated" outcomes that spoiled
+// earlier multi-round runs - because there is no natural cluster to drop into here: distances and
+// enemy counts are fixed by the test. The companion still WALKS (never teleports) back to the
+// player's original position during cleanup, for the same reason as before.
 //
 // Run directly against a live Factorio game + MCP server:
 //   bun run scripts/smoke/t021-combat-kills.ts
@@ -55,18 +61,37 @@ function asArray<T>(v: unknown): T[] {
 
 const SKILL_POLL_BUDGET_MS = 120000; // combat-until's own walk (30s) + attack (60s) timeouts, x margin
 const SKILL_POLL_INTERVAL_MS = 1500;
-const WALK_BUDGET_MS = 90000;
-const WALK_HOP_SIZE = 60; // break long walks into hops of this size; harmless when the total distance is shorter
-const WALK_POLL_INTERVAL_MS = 1200;
-const WALK_ARRIVE_THRESHOLD = 12; // "close enough" to hand off to combat_until's own scan (radius 50) / walk (range 6)
-const WALK_MAX_NOPATH_RETRIES = 5;
-const MAX_ROUND_ATTEMPTS = 4; // retries for a round that ends "retreated"/"no-targets" (environmental, not a fix failure)
+// The old natural-cluster hunt retried up to 4x for a re-picked spot after "retreated"/"no-targets" -
+// environmental noise from an unpredictable live map. A controlled arena (fixed distance, known enemy
+// count) shouldn't need that; kept at 2 (one retry) rather than dropped to 1 only to absorb a
+// transient RCON hiccup during teleport/spawn, not to paper over combat-outcome flakiness the arena
+// should have removed.
+const MAX_ROUND_ATTEMPTS = 2;
 const LOCAL_SNAPSHOT_RADIUS = 80; // bounds the unit_number ground truth to units already near the engagement zone,
 // far enough from the player's base that a remote base-turret kill can't slip into this set
 const SPAWNER_SAFETY_RADIUS = 15; // spawners this close to the engagement zone are checked for survival after the test
-const MIN_SPAWNER_DIST = 10.5; // safety margin over start_combat's own radius-10 capture (queues.lua:599-604) -
-// a target with a spawner this close would get the spawner added to the attack queue itself
-const MIN_TURRET_DIST = 12;
+
+// FIX 3: controlled combat arena constants (same shape as t026-companion-arming.ts's Check 5).
+const ARENA_SAFETY_RADIUS = 30; // min distance from any enemy spawner/turret/worm (worms are prototype type="turret") for an arena spot to qualify
+const ARENA_ENGAGE_DISTANCE = 15; // biter spawn distance from the companion - inside combat_until's own 50-tile scan
+const ARENA_CANDIDATE_OFFSETS: Array<{ dx: number; dy: number }> = [
+  { dx: 80, dy: 0 },
+  { dx: 0, dy: 80 },
+  { dx: -80, dy: 0 },
+  { dx: 0, dy: -80 },
+  { dx: 120, dy: 120 },
+  { dx: -120, dy: 120 },
+  { dx: 120, dy: -120 },
+  { dx: -120, dy: -120 },
+  { dx: 160, dy: 0 },
+  { dx: 0, dy: 160 },
+];
+
+// Accumulates the REAL insert() return values from every ensureCompanionReady staging call across
+// the whole run (it's called ~2x per round attempt, up to ~24 times across B1/B2/B3 retries, but
+// only actually stages when the companion isn't alive). Cleanup must remove exactly this much -
+// not a flat 1/50 - or it eats a gun/ammo the player already owned before the test started.
+const stagedStock = { guns: 0, ammo: 0 };
 
 interface SkillResult {
   skill: string;
@@ -75,16 +100,8 @@ interface SkillResult {
   target: number;
   outcome: string;
   success: boolean;
-}
-
-interface Cluster {
-  x: number;
-  y: number;
-  neighbors: number;
-  min_spawner_dist: number;
-  min_turret_dist: number;
-  name: string;
-  dist_to_ref: number;
+  uncausedDeaths?: number;
+  unarmedReason?: string;
 }
 
 function findCompanionLua(x: number, y: number, radius = 6): string {
@@ -127,77 +144,169 @@ async function pollUntilSkillDone(mcp: { client: any }, companionId: number): Pr
   return { status, result: status.lastSkillResult ? parseSkillResultLog(status.lastSkillResult.logPath) : null };
 }
 
-/**
- * Scores wandering `type="unit"` enemies for how safe/useful they are as a combat_until target:
- * far enough from spawners that start_combat's own radius-10 capture (queues.lua:599-604) can't
- * pull a spawner into the attack queue (the mod would then destroy it - explicitly off-limits),
- * far enough from turrets to avoid instant retaliation, a moderate neighbor count (enough targets
- * for a multi-kill round without being an overwhelming swarm), and closest to `ref`.
- */
-async function findClusterCandidates(
-  rcon: { send: (cmd: string) => Promise<string> },
-  ref: { x: number; y: number }
-): Promise<Cluster[]> {
+interface ArenaSpot {
+  found: boolean;
+  x?: number;
+  y?: number;
+}
+
+/** FIX 3: finds a staging point clear of enemy spawners/turrets/worms (worms are prototype
+ *  type="turret" too, so the same filter catches them) within ARENA_SAFETY_RADIUS. Tries
+ *  candidate offsets from `ref` outward, checking the CANDIDATE POINT's surroundings directly
+ *  (replaces the old per-unit distance filtering in findClusterCandidates, which scored
+ *  already-existing enemy units rather than picking empty ground). `found` is always present. */
+async function findSafeArenaSpot(rcon: { send: (cmd: string) => Promise<string> }, ref: { x: number; y: number }): Promise<ArenaSpot> {
+  const offsetsLua = ARENA_CANDIDATE_OFFSETS.map((o) => `{dx=${o.dx}, dy=${o.dy}}`).join(", ");
   const raw = await silent(
     rcon,
     `
       local surface = game.players[1].surface
-      local units = surface.find_entities_filtered{type="unit", force="enemy"}
-      local spawners = surface.find_entities_filtered{type="unit-spawner", force="enemy"}
-      local turrets = surface.find_entities_filtered{type="turret", force="enemy"}
-      local candidates = {}
-      for _, u in ipairs(units) do
-        if u.valid then
-          local dist_to_ref = ((u.position.x - ${ref.x})^2 + (u.position.y - ${ref.y})^2)^0.5
-          local min_spawner_dist = math.huge
-          for _, s in ipairs(spawners) do
-            if s.valid then
-              local d = ((u.position.x - s.position.x)^2 + (u.position.y - s.position.y)^2)^0.5
-              if d < min_spawner_dist then min_spawner_dist = d end
-            end
-          end
-          local min_turret_dist = math.huge
-          for _, t in ipairs(turrets) do
-            if t.valid then
-              local d = ((u.position.x - t.position.x)^2 + (u.position.y - t.position.y)^2)^0.5
-              if d < min_turret_dist then min_turret_dist = d end
-            end
-          end
-          local neighbors = 0
-          for _, u2 in ipairs(units) do
-            if u2.valid and u2 ~= u then
-              local d2 = ((u.position.x - u2.position.x)^2 + (u.position.y - u2.position.y)^2)^0.5
-              if d2 < 15 then neighbors = neighbors + 1 end
-            end
-          end
-          if min_spawner_dist > ${MIN_SPAWNER_DIST} and min_turret_dist > ${MIN_TURRET_DIST}
-             and neighbors >= 2 and neighbors <= 6 then
-            candidates[#candidates + 1] = {
-              x = u.position.x, y = u.position.y, neighbors = neighbors,
-              min_spawner_dist = min_spawner_dist, min_turret_dist = min_turret_dist,
-              name = u.name, dist_to_ref = dist_to_ref
-            }
-          end
+      local candidates = {${offsetsLua}}
+      local ref = {x = ${ref.x}, y = ${ref.y}}
+      local chosen_x, chosen_y
+      for _, c in ipairs(candidates) do
+        local px, py = ref.x + c.dx, ref.y + c.dy
+        local nearby = surface.find_entities_filtered{type={"unit-spawner", "turret"}, force="enemy", position={x=px, y=py}, radius=${ARENA_SAFETY_RADIUS}}
+        if #nearby == 0 then
+          local pos = surface.find_non_colliding_position("character", {x=px, y=py}, 10, 1)
+          if pos then chosen_x, chosen_y = pos.x, pos.y; break end
         end
       end
-      table.sort(candidates, function(a, b) return a.dist_to_ref < b.dist_to_ref end)
-      local top = {}
-      for i = 1, math.min(8, #candidates) do top[i] = candidates[i] end
-      rcon.print(helpers.table_to_json({count = #candidates, top = top}))
+      if chosen_x then
+        rcon.print(helpers.table_to_json({found = true, x = chosen_x, y = chosen_y}))
+      else
+        rcon.print(helpers.table_to_json({found = false}))
+      end
     `
   );
-  const parsed = JSON.parse(raw);
-  return asArray<Cluster>(parsed.top);
+  return JSON.parse(raw);
 }
 
-/** Idempotently gets the companion alive, healed, and armed (see arm comment below). Re-spawns
- *  it if a swarm killed it since the last round: companion_spawn (companion.lua:30) is a no-op
- *  ({status:"exists"}) when the tracked entity is still valid, and otherwise creates a fresh one
- *  right next to the current player position (companion.lua:37). */
-async function ensureCompanionReady(mcp: { client: any }, rcon: { send: (cmd: string) => Promise<string> }): Promise<{ respawned: boolean }> {
+/** Teleports the companion currently near (curX, curY) to (destX, destY). Test-harness-only. */
+async function teleportCompanionToArena(
+  rcon: { send: (cmd: string) => Promise<string> },
+  curX: number,
+  curY: number,
+  destX: number,
+  destY: number
+): Promise<{ teleported: boolean }> {
+  const raw = await silent(
+    rcon,
+    findCompanionLua(curX, curY, 8) +
+      `
+      local dest = __target.surface.find_non_colliding_position("character", {x=${destX}, y=${destY}}, 10, 0.5)
+      local teleported = false
+      if dest then teleported = __target.teleport(dest) end
+      rcon.print(helpers.table_to_json({teleported = teleported}))
+    `
+  );
+  return JSON.parse(raw);
+}
+
+/** Spawns small-biters (force "enemy") at the given positions via create_entity, nudged onto the
+ *  nearest non-colliding tile within 3 tiles so a tight cluster's fixed offsets don't fail to
+ *  place. Returns the real spawned unit_numbers (ground truth + teardown target - never a count
+ *  guess), via asArray since an all-failed spawn serializes as {} not []. */
+async function spawnBiters(rcon: { send: (cmd: string) => Promise<string> }, positions: Array<{ x: number; y: number }>): Promise<number[]> {
+  const posLua = positions.map((p) => `{x=${p.x}, y=${p.y}}`).join(", ");
+  const raw = await silent(
+    rcon,
+    `
+      local surface = game.players[1].surface
+      local positions = {${posLua}}
+      local ids = {}
+      for _, p in ipairs(positions) do
+        local spot = surface.find_non_colliding_position("small-biter", p, 3, 0.5) or p
+        local e = surface.create_entity{name="small-biter", position=spot, force="enemy"}
+        if e and e.valid then ids[#ids + 1] = e.unit_number end
+      end
+      rcon.print(helpers.table_to_json({ids = ids, count = #ids}))
+    `
+  );
+  return asArray<number>(JSON.parse(raw).ids);
+}
+
+/** Destroys any still-alive spawned units by unit_number, and nothing else - so teardown never
+ *  touches a pre-existing map enemy. A no-op for ids already dead (find_entities_filtered only
+ *  returns valid/alive entities), so it's safe to call again as a final safety net. */
+async function destroySpawnedUnits(rcon: { send: (cmd: string) => Promise<string> }, ids: number[]): Promise<{ destroyed: number }> {
+  if (ids.length === 0) return { destroyed: 0 };
+  const idSetLua = ids.map((id) => `[${id}] = true`).join(", ");
+  const raw = await silent(
+    rcon,
+    `
+      local surface = game.players[1].surface
+      local target_ids = {${idSetLua}}
+      local destroyed = 0
+      for _, u in ipairs(surface.find_entities_filtered{type="unit", force="enemy"}) do
+        if u.valid and target_ids[u.unit_number] then
+          u.destroy()
+          destroyed = destroyed + 1
+        end
+      end
+      rcon.print(helpers.table_to_json({destroyed = destroyed}))
+    `
+  );
+  return JSON.parse(raw);
+}
+
+/** Arranges `count` positions around `center` on a circle of radius `spread` tiles (a single
+ *  point for count 1). Used to place spawned biters at a known, controlled density - a small
+ *  `spread` yields a genuinely overlapping/dense cluster (B3), a larger one a looser group (B2). */
+function clusterPositions(center: { x: number; y: number }, count: number, spread: number): Array<{ x: number; y: number }> {
+  if (count <= 1) return [center];
+  const positions: Array<{ x: number; y: number }> = [];
+  for (let i = 0; i < count; i++) {
+    const angle = (2 * Math.PI * i) / count;
+    positions.push({ x: center.x + spread * Math.cos(angle), y: center.y + spread * Math.sin(angle) });
+  }
+  return positions;
+}
+
+/** Idempotently gets the companion alive, healed, and armed. Re-spawns it if a swarm killed it
+ *  since the last round: companion_spawn (companion.lua:30) is a no-op ({status:"exists"}) when
+ *  the tracked entity is still valid, and otherwise creates a fresh one right next to the current
+ *  player position (companion.lua:37).
+ *
+ *  Since T-026 the mod arms a freshly spawned companion itself, by transferring a gun + matching
+ *  ammo out of game.players[1]'s MAIN inventory (companion_spawn's own contract - see t026 smoke
+ *  test). This harness's job is only to make sure that inventory holds a suitable pair before
+ *  spawning; it must NOT arm the companion directly by side channel any more (that was a T-026
+ *  workaround for a real product gap that no longer exists). */
+async function ensureCompanionReady(mcp: { client: any }, rcon: { send: (cmd: string) => Promise<string> }): Promise<{ respawned: boolean; spawnRes: any }> {
+  // companion_spawn only consumes the staged gun+ammo on an actual fresh spawn - if the
+  // companion is already alive it's a no-op ("exists") that never touches the player's
+  // inventory. Stage ONLY when we can already tell a fresh spawn is coming, or repeated
+  // idempotent calls here (this runs up to twice per round attempt) would each leak another
+  // unconsumed gun+ammo into the player's main inventory.
+  const probe = await callTool(mcp.client, "companion_position", { companionId: 1 });
+  const wasAlive = probe?.position != null;
+
+  if (!wasAlive) {
+    const stageRaw = await silent(
+      rcon,
+      `
+        local inv = game.players[1].get_main_inventory()
+        local had_gun = inv.get_item_count("submachine-gun") > 0
+        local had_ammo = inv.get_item_count("piercing-rounds-magazine") > 0
+        local gun_inserted, ammo_inserted = 0, 0
+        if not had_gun then gun_inserted = inv.insert{name = "submachine-gun", count = 1} end
+        if not had_ammo then ammo_inserted = inv.insert{name = "piercing-rounds-magazine", count = 50} end
+        rcon.print(helpers.table_to_json({had_gun = had_gun, had_ammo = had_ammo, gun_inserted = gun_inserted, ammo_inserted = ammo_inserted}))
+      `
+    );
+    console.log("Player main-inventory arming stock (ensure-ready, staged ahead of a fresh spawn) ->", stageRaw);
+    const staged = JSON.parse(stageRaw);
+    stagedStock.guns += staged.gun_inserted;
+    stagedStock.ammo += staged.ammo_inserted;
+  }
+
   const spawnRes = await callTool(mcp.client, "companion_spawn", { companionId: 1 });
   const respawned = spawnRes.spawned === true;
-  if (respawned) console.log("NOTE: companion was respawned (died since the last check) - reported, not hidden.");
+  if (respawned) {
+    console.log("NOTE: companion was respawned (died since the last check) - reported, not hidden.");
+    check("ensure-ready: fresh companion_spawn armed the companion (armed:true)", spawnRes.armed === true, JSON.stringify(spawnRes));
+  }
 
   const pos = await callTool(mcp.client, "companion_position", { companionId: 1 });
   const x = pos.position.x;
@@ -209,96 +318,47 @@ async function ensureCompanionReady(mcp: { client: any }, rcon: { send: (cmd: st
   );
   console.log("Health headroom (ensure-ready) ->", healRaw);
 
-  // Live discovery this session: companion_spawn (companion.lua:37) creates a bare
-  // "character" entity - no gun, no ammo, ever. Nothing in the mod provisions one. Without
-  // this, shooting_state=shooting_enemies fires nothing and any "kills" a queue reports
-  // would be incidental deaths, not the companion's own. This is a TEST SCAFFOLD working
-  // around a real product gap (tracked as T-026), NOT part of the fix under test. Equip
-  // idempotently - only if the gun slot is actually empty (a respawn after death clears it).
-  const armRaw = await silent(
+  return { respawned, spawnRes };
+}
+
+/** Destroys any item-on-ground entities within a small radius of (x, y). Used right after a
+ *  companion_disappear spills gun/ammo to the ground (companion.lua's spill_equipment) - that
+ *  residue belongs to a companion this harness is removing (stale, from a previous run, or its
+ *  own at teardown), not to the player, so it's destroyed outright rather than reinserted. */
+async function destroyGroundResidue(rcon: { send: (cmd: string) => Promise<string> }, x: number, y: number): Promise<number> {
+  const raw = await silent(
     rcon,
-    findCompanionLua(x, y, 8) +
-      `
-      local guns = __target.get_inventory(defines.inventory.character_guns)
-      local already_armed = false
-      for i = 1, #guns do if guns[i].valid_for_read then already_armed = true end end
-      local gun_inserted, ammo_inserted = 0, 0
-      if not already_armed then
-        gun_inserted = guns.insert{name = "submachine-gun", count = 1}
-        ammo_inserted = __target.get_inventory(defines.inventory.character_ammo).insert{name = "piercing-rounds-magazine", count = 50}
-        __target.selected_gun_index = 1
+    `
+      local surface = game.players[1].surface
+      local destroyed = 0
+      for _, e in ipairs(surface.find_entities_filtered{type="item-entity", position={x=${x}, y=${y}}, radius=5}) do
+        if e.valid then e.destroy(); destroyed = destroyed + 1 end
       end
-      rcon.print(helpers.table_to_json({already_armed = already_armed, gun_inserted = gun_inserted, ammo_inserted = ammo_inserted}))
+      rcon.print(helpers.table_to_json({destroyed = destroyed}))
     `
   );
-  console.log("Weapon check/equip (ensure-ready) ->", armRaw);
-  return { respawned };
+  return JSON.parse(raw).destroyed;
 }
 
-interface WalkResult {
-  arrived: boolean;
-  finalStatus: any;
-  nopathRetries: number;
-}
-
-/** Walks the companion toward (tx, ty) in hops, polling move_to (idempotent while requesting/walking)
- *  for progress. Re-issues move_to on "no_path"/"stuck" - that is NOT the idempotent branch
- *  (queues.lua:160-164 only short-circuits for status requesting/walking), so a fresh call there
- *  actually restarts the pathfind. Bails out with arrived:false rather than hanging forever. */
-async function walkCompanionTo(mcp: { client: any }, companionId: number, tx: number, ty: number): Promise<WalkResult> {
-  const startPos = await callTool(mcp.client, "companion_position", { companionId });
-  const totalDist = Math.hypot(tx - startPos.position.x, ty - startPos.position.y);
-  console.log(`Walk: companion at (${startPos.position.x.toFixed(1)}, ${startPos.position.y.toFixed(1)}), target (${tx.toFixed(1)}, ${ty.toFixed(1)}), distance ${totalDist.toFixed(1)} tiles`);
-
-  const hops: Array<{ x: number; y: number }> = [];
-  const hopCount = Math.max(1, Math.ceil(totalDist / WALK_HOP_SIZE));
-  for (let i = 1; i <= hopCount; i++) {
-    const t = i / hopCount;
-    hops.push({ x: startPos.position.x + (tx - startPos.position.x) * t, y: startPos.position.y + (ty - startPos.position.y) * t });
+/** Removes any companion at `id` that is still alive - left over from a previous run of this
+ *  suite, or (in teardown) this run's own. fac_companion_disappear (companion.lua:53-74) clears
+ *  storage.companions[id] unconditionally, so a subsequent companion_spawn takes the fresh-spawn
+ *  branch ({spawned:true, ...}) rather than the {status:"exists"} no-op that skips spawn-time
+ *  arming entirely (the T-026 companion-arming suite's root cause for scoring 20/36 live, same bug
+ *  class this harness could hit for companion 1). A no-op if no companion is present at `id`. */
+async function clearStaleCompanion(mcp: { client: any }, rcon: { send: (cmd: string) => Promise<string> }, id: number): Promise<void> {
+  const posRes = await callTool(mcp.client, "companion_position", { companionId: id });
+  if (!posRes?.position) {
+    console.log(`Stale-companion cleanup: no companion ${id} present (clean start).`);
+    return;
   }
-  console.log(`Walk plan: ${hops.length} hop(s)`, JSON.stringify(hops));
-
-  let nopathRetries = 0;
-  const overallStart = Date.now();
-
-  for (let hopIndex = 0; hopIndex < hops.length; hopIndex++) {
-    const hop = hops[hopIndex]!;
-    const isLastHop = hopIndex === hops.length - 1;
-    const arriveThreshold = isLastHop ? WALK_ARRIVE_THRESHOLD : WALK_HOP_SIZE / 3;
-    console.log(`--- Hop ${hopIndex + 1}/${hops.length}: heading to (${hop.x.toFixed(1)}, ${hop.y.toFixed(1)}), arrive threshold ${arriveThreshold} ---`);
-
-    let hopArrived = false;
-    let lastStatus: any = null;
-    while (Date.now() - overallStart < WALK_BUDGET_MS) {
-      const mv = await callTool(mcp.client, "move_to", { companionId, x: hop.x, y: hop.y });
-      lastStatus = mv;
-      console.log("  move_to poll ->", JSON.stringify(mv));
-
-      if (mv.status === "arrived" || (typeof mv.distance_remaining === "number" && mv.distance_remaining <= arriveThreshold)) {
-        hopArrived = true;
-        break;
-      }
-      if (mv.status === "no_path" || mv.status === "stuck") {
-        nopathRetries++;
-        console.log(`  hit "${mv.status}" (retry ${nopathRetries}/${WALK_MAX_NOPATH_RETRIES}) - re-issuing move_to to restart the pathfind`);
-        if (nopathRetries > WALK_MAX_NOPATH_RETRIES) {
-          return { arrived: false, finalStatus: mv, nopathRetries };
-        }
-        await sleep(800);
-        continue;
-      }
-      await sleep(WALK_POLL_INTERVAL_MS);
-    }
-
-    if (!hopArrived) {
-      console.log(`Walk budget (${WALK_BUDGET_MS}ms) exceeded on hop ${hopIndex + 1}/${hops.length}`);
-      return { arrived: false, finalStatus: lastStatus, nopathRetries };
-    }
+  const disappear = await callTool(mcp.client, "companion_disappear", { companionId: id });
+  console.log(`Stale-companion cleanup: removed companion ${id} ->`, JSON.stringify(disappear));
+  const dropped = asArray<{ name: string; count: number }>(disappear?.dropped);
+  if (dropped.length > 0) {
+    const destroyed = await destroyGroundResidue(rcon, posRes.position.x, posRes.position.y);
+    console.log(`Stale-companion cleanup: destroyed ${destroyed} ground residue entities spilled by companion ${id} (${JSON.stringify(dropped)})`);
   }
-
-  const finalPos = await callTool(mcp.client, "companion_position", { companionId });
-  console.log("Walk complete. Final position ->", JSON.stringify(finalPos.position));
-  return { arrived: true, finalStatus: { status: "arrived" }, nopathRetries };
 }
 
 /** Ground truth #1: unit_numbers of enemy `type="unit"` entities within LOCAL_SNAPSHOT_RADIUS of
@@ -373,6 +433,7 @@ interface GroundTruth {
   localDeathCount: number;
   killStatsDelta: number;
   spawnersDestroyed: number;
+  uncausedDeaths: number;
 }
 
 interface RoundOutcome {
@@ -382,16 +443,28 @@ interface RoundOutcome {
   groundTruth: GroundTruth | null;
 }
 
-/** Runs one combat_until(companionId, targetType, maxKills) call, retrying in a re-picked spot
- *  when the round ends in a legitimate environmental outcome ("retreated"/"no-targets") rather
- *  than treating that as pass/fail - per the task, that's an environment condition to retry past,
- *  not evidence about the fix either way. */
+interface ArenaScenario {
+  biterCount: number;
+  clusterSpread: number; // tiles between spawned biters on clusterPositions' circle (0/ignored for count 1)
+}
+
+/** Runs one combat_until(companionId, targetType, maxKills) call inside a controlled arena
+ *  (FIX 3): teleport the companion to a spot verified clear of spawners/turrets/worms, spawn
+ *  exactly `scenario.biterCount` small-biters at a fixed distance, and let combat_until run. The
+ *  `spawnedIds` array is a shared, caller-owned accumulator - every id this call spawns is pushed
+ *  there immediately (before anything that could throw), so a top-level cleanup can always tear
+ *  down survivors even if this function never returns. Retries (MAX_ROUND_ATTEMPTS) only cover a
+ *  genuinely environmental outcome ("retreated"/"no-targets") or a failed teleport/arena-spot
+ *  search - not "no candidates found", since the arena no longer depends on what the live map
+ *  happens to contain. */
 async function runRound(
   mcp: { client: any },
   rcon: { send: (cmd: string) => Promise<string> },
   companionId: number,
   maxKills: number,
-  label: string
+  label: string,
+  scenario: ArenaScenario,
+  spawnedIds: number[]
 ): Promise<RoundOutcome> {
   let lastResult: SkillResult | null = null;
   let lastStatus: any = null;
@@ -402,37 +475,41 @@ async function runRound(
     await ensureCompanionReady(mcp, rcon);
 
     const pos = await callTool(mcp.client, "companion_position", { companionId });
-    const candidates = await findClusterCandidates(rcon, { x: pos.position.x, y: pos.position.y });
-    console.log(`${label}: found ${candidates.length} safe candidate cluster(s), nearest`, JSON.stringify(candidates[0]));
-    if (candidates.length === 0) {
-      console.log(`${label}: no safe candidate cluster available on this attempt - skipping to next attempt`);
+    const arenaSpot = await findSafeArenaSpot(rcon, { x: pos.position.x, y: pos.position.y });
+    console.log(`${label} attempt ${attempt}: arena spot ->`, JSON.stringify(arenaSpot));
+    check(`${label} attempt ${attempt}: a safe arena spot (clear of spawners/turrets/worms) was found`, arenaSpot.found === true, JSON.stringify(arenaSpot));
+    if (!arenaSpot.found) {
+      console.log(`${label} attempt ${attempt}: no safe arena spot found - retrying if attempts remain`);
       continue;
     }
-    const cluster = candidates[0]!;
-    const targetType = cluster.name.includes("spitter") ? "spitter" : "biter";
 
-    const distToCluster = Math.hypot(cluster.x - pos.position.x, cluster.y - pos.position.y);
-    if (distToCluster > WALK_ARRIVE_THRESHOLD) {
-      const walk = await walkCompanionTo(mcp, companionId, cluster.x, cluster.y);
-      check(`${label} attempt ${attempt}: companion walked to the engagement zone (not teleported)`, walk.arrived, JSON.stringify(walk));
-      if (!walk.arrived) {
-        console.log(`${label} attempt ${attempt}: walk failed to arrive - retrying with a fresh cluster pick`);
-        continue;
-      }
-    } else {
-      console.log(`${label}: companion already within ${distToCluster.toFixed(1)} tiles of the chosen cluster, no walk needed`);
+    const teleport = await teleportCompanionToArena(rcon, pos.position.x, pos.position.y, arenaSpot.x!, arenaSpot.y!);
+    check(`${label} attempt ${attempt}: companion teleported into the arena`, teleport.teleported === true, JSON.stringify(teleport));
+    if (!teleport.teleported) {
+      console.log(`${label} attempt ${attempt}: teleport failed - retrying if attempts remain`);
+      continue;
     }
 
-    await ensureCompanionReady(mcp, rcon); // re-heal/re-arm after the walk, before combat
+    await ensureCompanionReady(mcp, rcon); // re-heal/re-arm after the teleport, before combat
+
+    const engageCenter = { x: arenaSpot.x! + ARENA_ENGAGE_DISTANCE, y: arenaSpot.y! };
+    const roundSpawnedIds = await spawnBiters(rcon, clusterPositions(engageCenter, scenario.biterCount, scenario.clusterSpread));
+    spawnedIds.push(...roundSpawnedIds); // record before anything below can throw, so cleanup can always find these
+    console.log(`${label} attempt ${attempt}: spawned ${roundSpawnedIds.length}/${scenario.biterCount} biter(s) ->`, JSON.stringify(roundSpawnedIds));
+    check(
+      `${label} attempt ${attempt}: exactly ${scenario.biterCount} biter(s) spawned in the arena`,
+      roundSpawnedIds.length === scenario.biterCount,
+      JSON.stringify(roundSpawnedIds)
+    );
 
     const before = {
-      localIds: await snapshotLocalUnitNumbers(rcon, cluster.x, cluster.y),
+      localIds: await snapshotLocalUnitNumbers(rcon, engageCenter.x, engageCenter.y),
       killStats: await snapshotKillStats(rcon),
-      spawnerIds: await snapshotSpawnerIds(rcon, cluster.x, cluster.y),
+      spawnerIds: await snapshotSpawnerIds(rcon, engageCenter.x, engageCenter.y),
     };
     console.log(`${label} attempt ${attempt}: before-snapshot -> ${before.localIds.length} local units, ${before.spawnerIds.length} nearby spawner(s)`);
 
-    const startRaw = await callToolRaw(mcp.client, "combat_until", { companionId, targetType, maxKills });
+    const startRaw = await callToolRaw(mcp.client, "combat_until", { companionId, targetType: "biter", maxKills });
     console.log(`combat_until (${label} attempt ${attempt}) ->`, startRaw);
 
     const { status, result } = await pollUntilSkillDone(mcp, companionId);
@@ -441,7 +518,7 @@ async function runRound(
 
     const afterAllIds = await snapshotAllUnitNumbers(rcon);
     const afterKillStats = await snapshotKillStats(rcon);
-    const afterSpawnerIds = await snapshotSpawnerIds(rcon, cluster.x, cluster.y);
+    const afterSpawnerIds = await snapshotSpawnerIds(rcon, engageCenter.x, engageCenter.y);
 
     const localDeathCount = before.localIds.filter((id) => !afterAllIds.has(id)).length;
     const killStatsDelta = sumKillStatsDelta(before.killStats, afterKillStats);
@@ -452,8 +529,14 @@ async function runRound(
       localDeathCount,
       killStatsDelta,
       spawnersDestroyed,
+      uncausedDeaths: result?.uncausedDeaths ?? -1,
     };
     console.log(`${label} attempt ${attempt} ground truth ->`, JSON.stringify(groundTruth));
+
+    // Tear down any survivor from THIS round immediately, whether the round succeeded, timed
+    // out, or the companion retreated - never leave a spawned biter wandering the arena.
+    const cleanup = await destroySpawnedUnits(rcon, roundSpawnedIds);
+    console.log(`${label} attempt ${attempt}: teardown of any surviving spawned biter(s) ->`, JSON.stringify(cleanup));
 
     lastResult = result;
     lastStatus = status;
@@ -462,7 +545,7 @@ async function runRound(
     if (result?.outcome === "retreated" || result?.outcome === "no-targets") {
       console.log(
         `${label} attempt ${attempt} ended with outcome "${result.outcome}" - environmental, not a fix failure. ` +
-          `Retrying in a re-picked spot if attempts remain.`
+          `Retrying with a fresh arena if attempts remain.`
       );
       continue;
     }
@@ -480,11 +563,32 @@ async function main() {
 
   let originalPlayerPos: { x: number; y: number } | null = null;
   let companionStartPos: { x: number; y: number } | null = null;
+  // Every id create_entity hands back across B1/B2/B3, pushed by runRound as soon as it spawns
+  // them (before anything that could throw) - the top-level cleanup below sweeps whatever's left.
+  const arenaSpawnedIds: number[] = [];
+
+  console.log(
+    "NOTE: B1/B2/B3 now run in a controlled arena (teleport + create_entity) instead of hunting the " +
+      `live map for a natural cluster; MAX_ROUND_ATTEMPTS reduced from 4 to ${MAX_ROUND_ATTEMPTS} accordingly ` +
+      "(arena determinism removes the need to retry past bad natural spawns - see FIX 3 in the header comment)."
+  );
 
   try {
-    console.log("=== Setup: spawn companion 1 ===");
-    const spawnRes = await callTool(mcp.client, "companion_spawn", { companionId: 1 });
-    console.log("companion_spawn ->", JSON.stringify(spawnRes));
+    console.log("=== Setup: clear any stale companion 1 left over from a previous run, then spawn fresh ===");
+    await clearStaleCompanion(mcp, rcon, 1);
+    const setupReady = await ensureCompanionReady(mcp, rcon);
+    console.log("companion_spawn (setup) ->", JSON.stringify(setupReady.spawnRes));
+    check(
+      "Setup: companion 1 spawned genuinely fresh after stale-companion cleanup (spawned:true, not status:'exists')",
+      setupReady.respawned === true,
+      JSON.stringify(setupReady.spawnRes)
+    );
+    if (!setupReady.respawned) {
+      throw new Error(
+        `Companion 1 did not spawn fresh after clearStaleCompanion (${JSON.stringify(setupReady.spawnRes)}) - cleanup failed to clear ` +
+          "storage.companions[1], so this run's whole combat-kill setup rests on an unverified pre-existing companion. Aborting immediately."
+      );
+    }
 
     const posRes = await callTool(mcp.client, "companion_position", { companionId: 1 });
     console.log("companion_position (initial) ->", JSON.stringify(posRes));
@@ -498,7 +602,7 @@ async function main() {
     // B1 - single kill (re-confirming the already-verified clause)
     // -----------------------------------------------------------
     console.log("\n=== B1: combat_until(companionId:1, maxKills:1) ===");
-    const b1 = await runRound(mcp, rcon, 1, 1, "B1");
+    const b1 = await runRound(mcp, rcon, 1, 1, "B1", { biterCount: 1, clusterSpread: 0 }, arenaSpawnedIds);
     console.log(`B1 finished after ${b1.attempts} attempt(s)`);
 
     if (b1.result?.outcome === "retreated" || b1.result?.outcome === "no-targets") {
@@ -543,7 +647,7 @@ async function main() {
     // B2 - multi-kill total (the real target of this re-verification)
     // -----------------------------------------------------------
     console.log("\n=== B2: combat_until(companionId:1, maxKills:3) ===");
-    const b2 = await runRound(mcp, rcon, 1, 3, "B2");
+    const b2 = await runRound(mcp, rcon, 1, 3, "B2", { biterCount: 3, clusterSpread: 5 }, arenaSpawnedIds);
     console.log(`B2 finished after ${b2.attempts} attempt(s)`);
 
     if (b2.result?.outcome === "retreated" || b2.result?.outcome === "no-targets") {
@@ -580,6 +684,57 @@ async function main() {
         JSON.stringify(b2.groundTruth)
       );
     }
+
+    // -----------------------------------------------------------
+    // B3 - dense cluster (T-027): genuinely overlapping targets (narrow neighbor radius,
+    // higher neighbor-count band than B1/B2's default), still cross-checked against both
+    // backfill-immune ground truths at once.
+    // -----------------------------------------------------------
+    console.log("\n=== B3: combat_until(companionId:1, maxKills:4) against a dense cluster ===");
+    // 5 biters spawned (> maxKills:4) so the cluster is genuinely dense/overlapping (T-027's
+    // point) and at least one always survives combat_until's cap - exercising the teardown path.
+    const b3 = await runRound(mcp, rcon, 1, 4, "B3", { biterCount: 5, clusterSpread: 1.2 }, arenaSpawnedIds);
+    console.log(`B3 finished after ${b3.attempts} attempt(s)`);
+
+    if (b3.result?.outcome === "retreated" || b3.result?.outcome === "no-targets") {
+      check(
+        `B3 (dense cluster, T-027): exhausted ${MAX_ROUND_ATTEMPTS} attempts without a clean run (last outcome "${b3.result?.outcome}") - ` +
+          `the dense-cluster clause remains UNCONFIRMED, reported honestly rather than weakened to a pass`,
+        false,
+        JSON.stringify({ result: b3.result, groundTruth: b3.groundTruth })
+      );
+    } else {
+      // maxKills is a stopping FLOOR, not a mid-round cap: the Lua queue fights a round to target
+      // exhaustion and combat-until only re-checks totalKills < maxKills between rounds. So 5 biters
+      // in one round legitimately yields 5 kills against maxKills:4. Overshoot is the contract here,
+      // and asserting it beats hiding it by spawning exactly maxKills targets.
+      check("B3: SKILL_RESULT reports kills >= maxKills (4), overshoot allowed", (b3.result?.kills ?? -1) >= 4, JSON.stringify(b3.result));
+      check("B3: SKILL_RESULT reports outcome:'success'", b3.result?.outcome === "success", JSON.stringify(b3.result));
+      check("B3: lastSkillResult.exitCode === 0", b3.status?.lastSkillResult?.exitCode === 0, JSON.stringify(b3.status?.lastSkillResult));
+
+      // Every biter spawned into the arena died, and no pre-existing map enemy was miscounted.
+      check(
+        "B3 DECISIVE #1: unit_number-tracked local death count === the 5 biters spawned (backfill-immune)",
+        b3.groundTruth?.localDeathCount === 5,
+        JSON.stringify(b3.groundTruth)
+      );
+      check(
+        "B3 DECISIVE #2: engine kill-count-statistics delta === 5 (independent of the mod's own bookkeeping)",
+        b3.groundTruth?.killStatsDelta === 5,
+        JSON.stringify(b3.groundTruth)
+      );
+      check(
+        "B3 CROSS-CHECK (T-027 Done-when): reported total, unit_number death count, and engine kill-stat delta all agree on a DENSE cluster",
+        b3.groundTruth?.reportedKills === b3.groundTruth?.localDeathCount &&
+          b3.groundTruth?.localDeathCount === b3.groundTruth?.killStatsDelta,
+        JSON.stringify(b3.groundTruth)
+      );
+      check(
+        "B3: zero unit-spawners destroyed near the engagement zone",
+        b3.groundTruth?.spawnersDestroyed === 0,
+        JSON.stringify(b3.groundTruth)
+      );
+    }
   } finally {
     console.log("\n--- Cleanup ---");
     try {
@@ -588,41 +743,45 @@ async function main() {
       console.log("Cleanup companion_stop failed (reporting, not hiding):", e);
     }
 
-    try {
-      // If a swarm killed the companion after the last round, companion_spawn creates the
-      // replacement right next to the CURRENT player position (companion.lua:37) - there is
-      // nothing to walk back in that case, and trying anyway would burn the whole walk budget
-      // polling a dead companion (as happened on the run that motivated this check).
-      const respawnCheck = await callTool(mcp.client, "companion_spawn", { companionId: 1 });
-      console.log("Cleanup: companion_spawn liveness check ->", JSON.stringify(respawnCheck));
-      const posRes = await callTool(mcp.client, "companion_position", { companionId: 1 });
-      if (respawnCheck.spawned === true) {
-        console.log("Companion had died since the last round and was just respawned next to the player - no walk-back needed.");
-      } else if (posRes?.position && originalPlayerPos) {
-        console.log("=== Cleanup: walking companion back near the player ===");
-        const walkBack = await walkCompanionTo(mcp, 1, originalPlayerPos.x + 2, originalPlayerPos.y);
-        console.log("Walk back result ->", JSON.stringify(walkBack));
-        if (!walkBack.arrived) {
-          console.log("Walk back did not complete within budget - falling back to a teleport for cleanup only.");
-          const teleportBackRaw = await silent(
-            rcon,
-            findCompanionLua(posRes.position.x, posRes.position.y, 8) +
-              `
-              local dest = __target.surface.find_non_colliding_position("character", {x = ${originalPlayerPos.x + 2}, y = ${originalPlayerPos.y}}, 10, 0.5)
-              if dest then __target.teleport(dest) end
-              rcon.print(helpers.table_to_json({teleported_back = dest ~= nil}))
-            `
-          );
-          console.log("Fallback teleport back near player ->", teleportBackRaw);
-        }
+    // Final safety net for arena-spawned biters: each runRound attempt already tears its own
+    // spawns down right after computing ground truth, but redo it here in case an exception fired
+    // in between (e.g. combat_until itself threw). destroySpawnedUnits is a no-op for dead ids.
+    if (arenaSpawnedIds.length > 0) {
+      try {
+        const finalArenaCleanup = await destroySpawnedUnits(rcon, arenaSpawnedIds);
+        console.log("Cleanup: final teardown of any surviving arena-spawned biter(s) ->", JSON.stringify(finalArenaCleanup));
+      } catch (e) {
+        console.log("Cleanup arena biter removal failed (reporting, not hiding):", e);
       }
-    } catch (e) {
-      console.log("Cleanup walk/teleport-back failed (reporting, not hiding):", e);
     }
 
-    // Remove the gun/ammo this test scaffold granted (T-026: the mod itself never arms a
-    // companion). Safe to attempt unconditionally - removing items that aren't present is a no-op.
     try {
+      // Disappear companion 1 so the world is clean for the next run - the same fix as the T-026
+      // companion-arming suite's teardown, and for the same reason: a companion left alive here
+      // makes the NEXT run's initial companion_spawn take the {status:"exists"} no-op branch
+      // instead of a fresh, spawn-time-armed one. Supersedes the previous walk-the-companion-
+      // back-to-the-player behaviour, which left the entity alive on purpose - freshness parity
+      // with the next run wins over that convenience now.
+      await clearStaleCompanion(mcp, rcon, 1);
+    } catch (e) {
+      console.log("Cleanup companion_disappear failed (reporting, not hiding):", e);
+    }
+
+    // Remove the gun/ammo this harness staged for the mod's own arming (T-026: companion_spawn
+    // transfers a gun+ammo pair out of the player's MAIN inventory into the companion). The pair
+    // may have ended up in the companion's gun/ammo slots (transferred) or still be sitting in
+    // the player's main inventory (e.g. the last ensure-ready call staged it but no fresh spawn
+    // followed) - clean up both so this harness leaves zero net items in the world. Safe to
+    // attempt unconditionally - removing items that aren't present is a no-op.
+    try {
+      // Remove exactly what staging actually inserted (stagedStock, accumulated from every
+      // ensureCompanionReady call's real insert() return values) - never a flat guess. When the
+      // player already owned a gun/ammo before the test, staging skipped the insert (gun_inserted
+      // stays 0), so this removes 0 and leaves the player's own gun - wherever companion_spawn's
+      // transfer left it - alone. Companion inventory is drained first (that's where a transferred
+      // gun/ammo ends up), and only the remaining budget is taken from the player's main inventory
+      // (covers a staged-but-never-spawned leftover), so total removal across both never exceeds
+      // what was staged.
       const removeRaw = await silent(
         rcon,
         `
@@ -631,13 +790,24 @@ async function main() {
           for _, e in ipairs(__player.surface.find_entities_filtered{name="character"}) do
             if e.valid and e ~= __player.character then __target = e; break end
           end
-          if not __target then rcon.print(helpers.table_to_json({error = "companion not found for weapon cleanup"})); return end
-          local guns_removed = __target.get_inventory(defines.inventory.character_guns).remove{name = "submachine-gun", count = 1}
-          local ammo_removed = __target.get_inventory(defines.inventory.character_ammo).remove{name = "piercing-rounds-magazine", count = 50}
-          rcon.print(helpers.table_to_json({guns_removed = guns_removed, ammo_removed = ammo_removed}))
+          local guns_budget = ${stagedStock.guns}
+          local ammo_budget = ${stagedStock.ammo}
+          local guns_removed, ammo_removed = 0, 0
+          if __target then
+            guns_removed = __target.get_inventory(defines.inventory.character_guns).remove{name = "submachine-gun", count = guns_budget}
+            ammo_removed = __target.get_inventory(defines.inventory.character_ammo).remove{name = "piercing-rounds-magazine", count = ammo_budget}
+          end
+          local main_inv = __player.get_main_inventory()
+          local player_guns_removed = main_inv.remove{name = "submachine-gun", count = guns_budget - guns_removed}
+          local player_ammo_removed = main_inv.remove{name = "piercing-rounds-magazine", count = ammo_budget - ammo_removed}
+          rcon.print(helpers.table_to_json({
+            companion_found = __target ~= nil,
+            guns_removed = guns_removed, ammo_removed = ammo_removed,
+            player_guns_removed = player_guns_removed, player_ammo_removed = player_ammo_removed
+          }))
         `
       );
-      console.log("Cleanup: removed granted weapon/ammo (test scaffold, not part of the fix) ->", removeRaw);
+      console.log(`Cleanup: removed staged weapon/ammo (staged this run: ${stagedStock.guns} gun(s), ${stagedStock.ammo} ammo) ->`, removeRaw);
     } catch (e) {
       console.log("Cleanup weapon removal failed (reporting, not hiding):", e);
     }
