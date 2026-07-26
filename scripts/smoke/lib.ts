@@ -2,7 +2,7 @@
 // These scripts are NOT unit tests (deliberately not named *.test.ts - bun test
 // would try to run them without a live game). Run them directly with bun.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { resolve } from "node:path";
 import { RCONClient } from "../../src/rcon/client";
 import { getRCONConfig } from "../../src/config";
@@ -13,11 +13,28 @@ export const EPS = 0.01;
 // so it must be spawned from the repo root regardless of where this is invoked.
 const REPO_ROOT = resolve(import.meta.dir, "../..");
 
+/** The MCP SDK does NOT pass the parent's environment to the server it spawns - it substitutes a
+ *  sanitized default (PATH, HOME, ...). Without this merge the spawned server falls back to the
+ *  repo's .env while the harness's own side-channel RCON honours whatever FACTORIO_* overrides the
+ *  caller exported, so the two halves of a suite silently talk to DIFFERENT Factorio instances -
+ *  which reads exactly like a code failure. (Caught 2026-07-26 running t034 against a headless
+ *  test server on a second RCON port: the banner reported stale mod code that a direct RCON probe
+ *  had just shown fresh.) Forwarding the real environment is also what makes
+ *  `FACTORIO_RCON_PORT=... bun run scripts/smoke/<suite>.ts` work at all. */
+function serverEnvironment(): Record<string, string> {
+  const merged: Record<string, string> = { ...getDefaultEnvironment() };
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined) merged[k] = v;
+  }
+  return merged;
+}
+
 export async function connectMCP(): Promise<{ client: Client; close: () => Promise<void> }> {
   const transport = new StdioClientTransport({
     command: "bun",
     args: ["run", "src/index.ts"],
     cwd: REPO_ROOT,
+    env: serverEnvironment(),
     stderr: "pipe",
   });
   const client = new Client({ name: "smoke-test", version: "0.0.1" }, { capabilities: {} });

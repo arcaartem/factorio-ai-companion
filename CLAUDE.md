@@ -76,12 +76,24 @@ diff -rq factorio-mod "$MODS"   # must print nothing
 ```
 Then main menu → Host Saved Game (control-stage files reload; no app restart — see Gotchas).
 
-**Neither `game.reload_script()` nor `/fac_version` is a shortcut here.** `game.reload_script()` is
-reachable from `/silent-command` over RCON and returns `{success:true}`, but it does **not** reload
-the mod in a hosted multiplayer game (verified 2026-07-26 behaviourally, not from the success
-reply). And `/fac_version` reads `script.active_mods`, which is pinned at *application* startup — it
-happily reported `0.13.7` while freshly reloaded 0.16.0 code was running. The only trustworthy
-evidence is `diff -rq` plus a behavioural probe of something the new code changes.
+**No in-game reload exists — `game.reload_script()`, `game.reload_mods()` and `/fac_version` are all
+dead ends.** Both reload calls are reachable from `/silent-command` over RCON and both return
+success while changing nothing in a hosted multiplayer game (each verified 2026-07-26
+behaviourally, not from the reply). `/fac_version` reads `script.active_mods`, pinned at
+*application* startup — it reported `0.13.7` while 0.16.0 code ran. The only trustworthy evidence is
+`diff -rq` plus a behavioural probe of something the new code changes.
+
+**Preferred loop — don't re-host at all: `bun run scripts/smoke/test-server.ts <suite>`.** It
+deploys `factorio-mod/` (with the `diff -rq` gate), copies your newest save, starts a *disposable
+headless server* on its own ports and its own `write-data` dir, runs the suite against it, and tears
+everything down. A fresh process always reads the mod off disk, so this **is** the reload — and it
+runs alongside the game you're playing without touching it, so the suites stop teleporting
+companions and planting ore in your real world. Two things to know: a second Factorio process needs
+its own `write-data` (the first holds an exclusive lock on the user dir) and its own `--port`, both
+of which the script handles; and with no client connected `game.players[1]` is valid but has **no
+character**, so companions spawn *unarmed* — mining/movement/world suites are fine, the combat
+suites (t021, t026) still need your interactive game. Use `--serve`/`--keep` to hold the server up,
+`--save <path>` to pin a world.
 
 **Always run that `diff` before any live test.** The deployed dir is the only code Factorio
 actually executes, and it has silently held a *partial* sync (2026-07-24: `building.lua` at HEAD
@@ -119,4 +131,4 @@ while `queues.lua`/`init.lua`/`companion.lua` predated the fixes they were suppo
 - Validation: `bun run scripts/validate-tools.ts` (52 tools = 52 Lua commands as of mod 0.16.0; the count last moved at 0.15.0, which removed `companion_realistic`; also checks arity/argument order, not just names). CAVEAT: it covers the request side only — Lua *response shapes* and the hand-rolled command strings inside `src/skills/*.ts` are unchecked, and both have drifted before. Contract changes need a live in-game check, not just a green validator. The arity check also cannot catch an optional Lua parameter that NO tool exposes — `checkArity` only asserts the TS placeholder count falls within `[mandatory..total]`, so `fac_companion_inventory` declaring 1 of its 3 captures passes cleanly while its chest-inspection branch stays unreachable through MCP (T-023).
 - Lua has no test harness here, but `luac -p factorio-mod/commands/*.lua` (mise-provided) is a free syntax gate — neither the validator nor `bun test` parses Lua at all.
 - Lefthook runs validation + `bun test` on pre-commit
-- Live smoke tests: `scripts/smoke/` — drives the real MCP server over stdio (`bun run src/index.ts`) with a second RCON connection as a side channel, one script per fix (`bun run scripts/smoke/t019-building-item-loss.ts`, …). **The combat suites construct a controlled arena rather than searching the live map**: they find a spot 80-160 tiles out verified clear of spawners and worms (worms are prototype `type="turret"`), teleport the companion in, and `create_entity` exactly the enemies needed, tracked by `unit_number` for exact teardown. **`unit_number` is nil on resource entities** (and simple entities generally), so an ore arena must key teardown on the exact recorded position instead — tracking ore by id silently no-ops and leaves every planted tile in the live world (bit `t031` for 4 runs; verify world cleanliness independently, since a no-op teardown logs nothing). Spawning items and teleporting is sanctioned **in harnesses only** — the mod's gameplay behaviour stays within player parity. Deliberately NOT named `*.test.ts`: lefthook runs `bun test` on pre-commit and these need a live hosted game. Note `src/mcp/server.ts` only exports the class — the entry point is `src/index.ts`, and it must be spawned with the repo root as cwd so relative skill paths, `.fac-skills/` and `.env` resolve.
+- Live smoke tests: `scripts/smoke/` — drives the real MCP server over stdio (`bun run src/index.ts`) with a second RCON connection as a side channel, one script per fix (`bun run scripts/smoke/t019-building-item-loss.ts`, …). **The combat suites construct a controlled arena rather than searching the live map**: they find a spot 80-160 tiles out verified clear of spawners and worms (worms are prototype `type="turret"`), teleport the companion in, and `create_entity` exactly the enemies needed, tracked by `unit_number` for exact teardown. **`unit_number` is nil on resource entities** (and simple entities generally), so an ore arena must key teardown on the exact recorded position instead — tracking ore by id silently no-ops and leaves every planted tile in the live world (bit `t031` for 4 runs; verify world cleanliness independently, since a no-op teardown logs nothing). Spawning items and teleporting is sanctioned **in harnesses only** — the mod's gameplay behaviour stays within player parity. Deliberately NOT named `*.test.ts`: lefthook runs `bun test` on pre-commit and these need a live hosted game. Note `src/mcp/server.ts` only exports the class — the entry point is `src/index.ts`, and it must be spawned with the repo root as cwd so relative skill paths, `.fac-skills/` and `.env` resolve. **The MCP SDK does not pass the parent environment to the server it spawns** — it substitutes a sanitized default — so `lib.ts`'s `connectMCP` merges `process.env` in explicitly. Without that merge a suite's MCP half falls back to the repo `.env` while its side-channel RCON honours the caller's `FACTORIO_*` overrides, and the two halves silently drive **different Factorio instances**; it presents as a code failure (t034's banner reported stale mod code that a direct RCON probe had just shown fresh). Prefer `test-server.ts` (see Setup) over running a suite by hand — it sets that env correctly and gives you a fresh mod load for free.
