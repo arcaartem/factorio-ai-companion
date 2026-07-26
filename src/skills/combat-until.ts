@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { RCONClient } from "../rcon/client";
 import { getRCONConfig } from "../config";
-import { sleep } from "../utils/connection";
+import { sleep, asArray } from "../utils/connection";
 
 const POLL_INTERVAL = 500;
 const ATTACK_RANGE = 6;
@@ -80,9 +80,7 @@ interface Enemy {
 
 async function scanEnemies(): Promise<Enemy[]> {
   const data = await exec(`/fac_world_enemies ${companionId} ${SCAN_RADIUS}`);
-  if (!data?.enemies) return [];
-
-  let enemies = data.enemies as Enemy[];
+  let enemies = asArray<Enemy>(data?.enemies);
 
   if (targetType !== "all") {
     enemies = enemies.filter((e: Enemy) => {
@@ -119,17 +117,26 @@ async function attack(
   x: number,
   y: number,
   startPos: {x: number, y: number} | null
-): Promise<{kills: number, retreated: boolean}> {
+): Promise<{kills: number, retreated: boolean, uncausedDeaths: number, unarmedReason?: string}> {
   const result = await exec(`/fac_action_attack_start ${companionId} ${x} ${y}`);
-  if (!result?.started) return {kills: 0, retreated: false};
+  if (!result?.started) {
+    // "No weapon equipped"/"No ammo" are terminal - the companion has no path to ever land a
+    // kill this run, so retrying against the same empty holster 30 times is pure dead time.
+    if (result?.error === "No weapon equipped" || result?.error === "No ammo") {
+      return {kills: 0, retreated: false, uncausedDeaths: 0, unarmedReason: result.error};
+    }
+    return {kills: 0, retreated: false, uncausedDeaths: 0};
+  }
 
   let totalKills = 0;
+  let uncausedDeaths = 0;
   const startTime = Date.now();
   const timeout = 60000;
 
   while (Date.now() - startTime < timeout) {
     const status = await exec(`/fac_action_attack_status ${companionId}`);
     totalKills = status?.status?.kills ?? totalKills;
+    uncausedDeaths = status?.status?.uncaused_deaths ?? uncausedDeaths;
 
     if (!status?.status?.active) {
       break;
@@ -138,24 +145,32 @@ async function attack(
     const health = await getHealth();
     if (health && health.pct < 30) {
       // The stop response carries the round's authoritative count, including any kill
-      // landed since the last poll; totalKills is only as fresh as that poll.
+      // landed since the last poll; totalKills is only as fresh as that poll. stopped?.kills
+      // can legitimately be 0 (queue already completed and was deleted before this stop landed),
+      // so ?? would wrongly discard a real polled total - take whichever is higher.
       const stopped = await exec(`/fac_action_attack_stop ${companionId}`);
       await say("Health low, retreating!");
       if (startPos) {
         await walkTo(startPos.x, startPos.y);
       }
-      return {kills: stopped?.kills ?? totalKills, retreated: true};
+      return {
+        kills: Math.max(stopped?.kills ?? 0, totalKills),
+        retreated: true,
+        uncausedDeaths: stopped?.uncaused_deaths ?? uncausedDeaths,
+      };
     }
 
     await sleep(POLL_INTERVAL);
   }
 
-  return {kills: totalKills, retreated: false};
+  return {kills: totalKills, retreated: false, uncausedDeaths};
 }
 
 async function main(): Promise<void> {
   let totalKills = 0;
-  let outcome: "success" | "retreated" | "no-targets" | "max-attempts" | "gone" | "error" = "success";
+  let uncausedDeaths = 0;
+  let outcome: "success" | "retreated" | "no-targets" | "max-attempts" | "unarmed" | "gone" | "error" = "success";
+  let unarmedReason: string | undefined;
 
   try {
     await client.connect();
@@ -194,8 +209,16 @@ async function main(): Promise<void> {
       await say(`Attacking ${target.name}!`);
       const result = await attack(target.position.x, target.position.y, startPos);
       totalKills += result.kills;
+      uncausedDeaths += result.uncausedDeaths;
 
       console.log(`[#${companionId}] Kills this round: ${result.kills}, total: ${totalKills}`);
+
+      if (result.unarmedReason) {
+        outcome = "unarmed";
+        unarmedReason = result.unarmedReason;
+        console.log(`[#${companionId}] Unarmed, stopping: ${unarmedReason}`);
+        break;
+      }
 
       if (result.kills > 0) {
         await say(`Killed ${result.kills}! Total: ${totalKills}/${maxKills}`);
@@ -214,7 +237,9 @@ async function main(): Promise<void> {
       outcome = "max-attempts";
     }
 
-    if (outcome !== "retreated") {
+    if (outcome === "unarmed") {
+      await say(`Can't fight: ${unarmedReason}`);
+    } else if (outcome !== "retreated") {
       await say(`Combat done! ${totalKills} kills.`);
       console.log(`[#${companionId}] Combat complete. Total kills: ${totalKills}`);
     }
@@ -242,6 +267,8 @@ async function main(): Promise<void> {
       target: maxKills,
       outcome,
       success: outcome === "success",
+      uncausedDeaths,
+      ...(unarmedReason ? { unarmedReason } : {}),
     })}`);
     await client.disconnect();
   }
