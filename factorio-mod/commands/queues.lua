@@ -9,7 +9,6 @@ local MIN_ACTION_TICKS = 30
 local BUILD_TICKS = 60
 local ATTACK_COOLDOWN = 15
 local ATTACK_RANGE = 6
-local MINING_RANGE = 5
 local UNCAUSED_DEATH_RADIUS = 20 -- bounds the q.uncaused diagnostic to queues whose companion is plausibly
                                   -- involved in a given unattributed death, so one stray death doesn't
                                   -- inflate the count on every OTHER active combat queue too (see handle_entity_died)
@@ -395,14 +394,11 @@ function M.tick_harvest_queues()
       return true
     end
 
-    -- Too far from mining area (reach enforcement is opt-in via c.realistic)
-    if c.realistic then
-      local limit = c.entity.resource_reach_distance or MINING_RANGE
-      if u.distance(c.entity.position, q.position) > limit then
-        c.entity.mining_state = {mining = false}
-        u.log_error("harvest aborted: too far", "companion " .. cid)
-        return true
-      end
+    -- Too far from mining area (reach enforcement is always on, see check_reach)
+    if u.check_reach(cid, c, q.position, "resource") then
+      c.entity.mining_state = {mining = false}
+      u.log_error("harvest aborted: too far", "companion " .. cid)
+      return true
     end
 
     -- Start mining first resource

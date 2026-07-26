@@ -56,15 +56,6 @@ export const TOOLS: Record<string, {
     rcon: "/fac_companion_stop_all {companionId}",
     params: { companionId: { type: "number", required: true } }
   },
-  companion_realistic: {
-    desc: "Toggle per-companion reach enforcement (opt-in 'realistic' mode). Default OFF lets the companion act at any range; ON requires being within reach for building/resource actions, like a human player.",
-    rcon: "/fac_companion_realistic {companionId} {enabled}",
-    params: {
-      companionId: { type: "string", desc: "Companion ID or name, or 'all' to apply to every companion", required: true },
-      enabled: { type: "boolean", desc: "true to enforce reach, false to act at any range", required: true }
-    }
-  },
-
   // Movement
   move_to: {
     desc: "Move companion to specific coordinates",
@@ -108,7 +99,7 @@ export const TOOLS: Record<string, {
     }
   },
   resource_mine: {
-    desc: "Start mining at coordinates (companion must be within 5 tiles)",
+    desc: "Start mining at coordinates. Always enforced: companion must be within the engine's resource reach (~2.7 tiles on a default character), like a human player - a refusal returns {error:\"Too far\", target} to walk to and retry.",
     rcon: "/fac_resource_mine {companionId} {x} {y} {count} {resourceName}",
     params: {
       companionId: { type: "number", required: true },

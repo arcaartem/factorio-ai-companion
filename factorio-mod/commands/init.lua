@@ -97,10 +97,9 @@ end
 -- else (default) for building/manipulation actions.
 -- Returns nil when pos is in range, or a uniform machine-readable error table
 -- when not, so the orchestrator can walk to `target` and retry.
--- Reach enforcement is opt-in per companion via c.realistic (default/nil/false
--- = unrestricted, act at any range).
+-- Reach enforcement is always on, mirroring the same engine limits the human
+-- player is subject to - there is no unrestricted/god-mode companion.
 function M.check_reach(id, c, pos, kind)
-  if not c.realistic then return nil end
   local limit
   if kind == "resource" then
     limit = c.entity.resource_reach_distance or 10

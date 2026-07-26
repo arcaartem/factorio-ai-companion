@@ -1,4 +1,13 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.15.0
+Date: 2026-07-26
+  Changes:
+    - Reach enforcement is now always on for every companion, matching human player limits -
+      removed the opt-in companion_realistic flag (and the fac_companion_realistic command)
+      entirely, per the player-parity decision superseding the earlier opt-in design
+    - The harvest queue's too-far abort now shares check_reach's single reach-limit source
+      instead of hand-rolling its own distance check with a different fallback value
+---------------------------------------------------------------------------------------------------
 Version: 0.14.0
 Date: 2026-07-26
   Features:

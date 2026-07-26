@@ -6,6 +6,13 @@ import { connectWithRetry, sleep, asArray } from "../utils/connection";
 const POLL_INTERVAL = 500;
 const MINING_TIMEOUT = 30000;
 const WALKING_TIMEOUT = 60000;
+// Engine's real resource_reach_distance is 2.7 (live-probed); stay safely inside it
+// so a mine request isn't refused with "Too far" right after we decide not to walk.
+const RESOURCE_REACH = 2.5;
+// fac_resource_nearest floors its returned coordinates (factorio-mod/commands/resource.lua:89),
+// which can stack up to ~1.4 tiles of rounding error on top of the arrival check below - keep
+// this tight so we actually land within the real 2.7-tile reach, not just "close enough".
+const ARRIVAL_THRESHOLD = 1.0;
 
 const companionId = parseInt(process.argv[2]);
 const resourceType = process.argv[3];
@@ -76,17 +83,28 @@ async function walkTo(x: number, y: number): Promise<boolean> {
     if (!pos) break;
 
     const dist = Math.sqrt(Math.pow(pos.x - x, 2) + Math.pow(pos.y - y, 2));
-    if (dist < 2) return true; // Arrived
+    if (dist < ARRIVAL_THRESHOLD) return true; // Arrived
 
     await sleep(POLL_INTERVAL);
   }
   return false;
 }
 
-async function startMining(x: number, y: number, count: number): Promise<boolean> {
+async function startMining(x: number, y: number, count: number, retrying = false): Promise<boolean> {
   // Pass resource name to filter only the specific resource type
   const result = await exec(`/fac_resource_mine ${companionId} ${x} ${y} ${count} ${resource}`);
-  return result?.mining === true;
+  if (result?.mining === true) return true;
+
+  // Refused as out of reach: walk to the position the engine actually wants and retry once.
+  // Not a loop - if it's still too far after walking there, give up on this spot.
+  if (!retrying && result?.error === "Too far" && result?.target) {
+    console.log(`[#${companionId}] Too far to mine (${x}, ${y}), walking to (${result.target.x}, ${result.target.y}) and retrying once`);
+    const arrived = await walkTo(result.target.x, result.target.y);
+    if (!arrived) return false;
+    return startMining(x, y, count, true);
+  }
+
+  return false;
 }
 
 async function waitForMiningComplete(): Promise<number> {
@@ -158,7 +176,7 @@ async function main(): Promise<void> {
       console.log(`[#${companionId}] Found ${resource} at (${nearest.position.x}, ${nearest.position.y}), distance: ${nearest.distance}`);
 
       // Walk to resource if needed
-      if (nearest.distance > 5) {
+      if (nearest.distance > RESOURCE_REACH) {
         await say(`Walking to ${resource} (${Math.floor(nearest.distance)} tiles)...`);
         const arrived = await walkTo(nearest.position.x, nearest.position.y);
         if (!arrived) {
