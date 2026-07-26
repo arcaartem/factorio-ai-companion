@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { RCONClient } from "../rcon/client";
 import { getRCONConfig } from "../config";
-import { connectWithRetry, sleep } from "../utils/connection";
+import { connectWithRetry, sleep, asArray } from "../utils/connection";
 
 const POLL_INTERVAL = 500;
 const MINING_TIMEOUT = 30000;
@@ -50,15 +50,9 @@ async function getPosition(): Promise<{x: number, y: number} | null> {
 
 async function getInventoryCount(itemName: string): Promise<number> {
   const data = await exec(`/fac_companion_inventory ${companionId}`);
-  if (!data?.items) return 0;
-
-  // items can be:
-  // - Empty object {} when empty
-  // - Array [{name, count, quality}, ...] when items exist
-  if (Array.isArray(data.items)) {
-    for (const item of data.items) {
-      if (item.name === itemName) return item.count || 0;
-    }
+  const items = asArray<{name: string, count?: number}>(data?.items);
+  for (const item of items) {
+    if (item.name === itemName) return item.count || 0;
   }
   return 0;
 }

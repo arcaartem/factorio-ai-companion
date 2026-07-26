@@ -1,5 +1,6 @@
 // Test the /companion_help command
 import { RCONClient } from "./rcon/client";
+import { asArray } from "./utils/connection";
 
 const rcon = new RCONClient({
   host: process.env.FACTORIO_HOST || "127.0.0.1",
@@ -21,15 +22,16 @@ async function main() {
         const help = JSON.parse(response.data);
         console.log("\n=== Companion Commands (v" + help.version + ") ===\n");
 
-        help.commands.forEach((cmd: any, i: number) => {
+        const commands = asArray<{name: string, params: string, description: string, examples: string[]}>(help.commands);
+        commands.forEach((cmd, i: number) => {
           console.log(`${i + 1}. ${cmd.name} ${cmd.params}`);
           console.log(`   ${cmd.description}`);
-          console.log(`   Examples: ${cmd.examples.join(", ")}`);
+          console.log(`   Examples: ${asArray<string>(cmd.examples).join(", ")}`);
           console.log();
         });
 
         console.log("Notes:");
-        help.notes.forEach((note: string) => console.log(`- ${note}`));
+        asArray<string>(help.notes).forEach((note) => console.log(`- ${note}`));
       } catch (e) {
         console.error("JSON parse error. Response data:", response.data);
       }
