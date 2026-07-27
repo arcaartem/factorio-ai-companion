@@ -86,7 +86,7 @@ export const TOOLS: Record<string, {
     rcon: "/fac_resource_nearest {companionId} {resourceType}",
     params: {
       companionId: { type: "number", required: true },
-      resourceType: { type: "string", desc: "Resource: iron-ore, copper-ore, coal, stone", required: true }
+      resourceType: { type: "string", desc: "Resource: iron-ore, copper-ore, coal, stone, or wood (selects the nearest tree)", required: true }
     }
   },
   resource_list: {
@@ -106,7 +106,7 @@ export const TOOLS: Record<string, {
       x: { type: "number", required: true },
       y: { type: "number", required: true },
       count: { type: "number", desc: "Number to mine", default: 1 },
-      resourceName: { type: "string", desc: "Optional: specific resource", default: "" }
+      resourceName: { type: "string", desc: "Optional: specific resource; \"wood\" harvests trees", default: "" }
     }
   },
   resource_mine_status: {
@@ -426,7 +426,7 @@ export const SKILLS: Record<string, {
     script: "skills/mine-until.ts",
     params: {
       companionId: { type: "number", required: true },
-      resource: { type: "string", desc: "Resource: iron, copper, coal, stone, uranium", required: true },
+      resource: { type: "string", desc: "Resource: iron, copper, coal, stone, uranium, or wood (chops trees)", required: true },
       amount: { type: "number", desc: "Target amount", default: 50 }
     }
   },

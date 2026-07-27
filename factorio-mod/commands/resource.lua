@@ -2,7 +2,8 @@
 local u = require("commands.init")
 local queues = require("commands.queues")
 
-local normalize = {copper = "copper-ore", iron = "iron-ore", coal = "coal", stone = "stone", uranium = "uranium-ore", oil = "crude-oil"}
+-- Resource name aliases and the ore-vs-tree filter split live in commands.init so the harvest
+-- queue resolves a token exactly the way these commands do.
 
 commands.add_command("fac_resource_list", nil, function(cmd)
   u.safe_command(function()
@@ -34,9 +35,10 @@ commands.add_command("fac_resource_mine", nil, function(cmd)
     if not id then u.error_response("Companion not found"); return end
     local x, y, count = tonumber(args[2]), tonumber(args[3]), tonumber(args[4]) or 1
     local resource_name = args[5] ~= "" and args[5] or nil
-    -- Normalize common resource names
-    if resource_name then
-      resource_name = normalize[resource_name] or resource_name
+    -- Normalize common resource names ("wood"/"tree" pass through - start_harvest resolves
+    -- them to a type filter, since trees have no single prototype name to match on).
+    if resource_name and not u.is_wood(resource_name) then
+      resource_name = u.normalize_resource(resource_name)
     end
     if not x or not y then u.error_response("Invalid coordinates"); return end
     local tpos = {x = x, y = y}
@@ -82,13 +84,20 @@ commands.add_command("fac_resource_nearest", nil, function(cmd)
     local args = u.parse_args("^(%S+)%s+(%S+)$", cmd.parameter)
     local id, c = u.find_companion(args[1])
     if not id then u.error_response("Companion not found"); return end
-    local name = normalize[args[2]] or args[2]
     local pos = c.entity.position
-    local closest, min = u.find_nearest(c.entity.surface, pos, {name = name})
+    local closest, min = u.find_nearest(c.entity.surface, pos, u.resource_filter(args[2]))
     if not closest then u.json_response({id = id, error = "Not found"}); return end
     -- Exact position, not math.floor'd. Ore sits at tile CENTRES (x.5, y.5), so flooring moved
     -- the reported target ~0.71 tiles off the entity - which callers then spend out of the
     -- engine's 2.7-tile resource_reach_distance before they have walked anywhere.
-    u.json_response({id = id, resource = closest.name, position = {x = closest.position.x, y = closest.position.y}, distance = min, amount = closest.amount})
+    -- `amount` is a resource-only property; reading it off a tree raises, so it is reported
+    -- only for the entities that actually carry one.
+    u.json_response({
+      id = id,
+      resource = closest.name,
+      position = {x = closest.position.x, y = closest.position.y},
+      distance = min,
+      amount = closest.type == "resource" and closest.amount or nil
+    })
   end)
 end)

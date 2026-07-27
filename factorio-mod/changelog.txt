@@ -1,4 +1,29 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.18.0
+Date: 2026-07-27
+  Features:
+    - The companion can harvest WOOD. resource_mine and resource_mine_until now accept the token
+      "wood" (or "tree") and chop trees, where before they replied {error = "No resource"}: both
+      fac_resource_mine and queues.start_harvest seeded their pool with
+      find_entities_filtered{type = "resource"}, and a tree is type = "tree". This was a
+      capability gap, not a queue bug - no change to the harvest tick was needed, and a tree
+      actually suits it better than ore does, since a tree is genuinely consumed when mined
+      (entity.valid -> false, which is exactly the advance condition) whereas an ore tile only
+      decrements amount and stays valid
+    - resource_nearest accepts "wood"/"tree" too, so a caller can locate a tree and then mine it
+      through the same pair of calls it already uses for ore
+  Changes:
+    - Wood is the one harvestable that cannot be selected by name - trees ship dozens of
+      prototypes (tree-01 .. dead-dry-hairy-tree), so {name = "wood"} matches nothing. The
+      ore-by-name vs tree-by-type split now lives in one helper, u.resource_filter, which
+      resource_nearest, world_nearest and start_harvest all route through. resource.lua and
+      world.lua had each carried a private copy of the resource alias table and only world.lua
+      knew about trees; those copies are gone
+  Bugfixes:
+    - resource_nearest no longer risks raising on a tree. `amount` is a resource-only LuaEntity
+      property, so it is now reported only for entities of type "resource" and omitted for trees
+
+---------------------------------------------------------------------------------------------------
 Version: 0.17.0
 Date: 2026-07-26
   Bugfixes:

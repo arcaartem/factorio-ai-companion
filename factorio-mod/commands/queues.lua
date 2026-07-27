@@ -350,9 +350,15 @@ function M.start_harvest(cid, position, target_count, resource_name)
   local c = valid_companion(cid)
   if not c then return {error = "Invalid companion"} end
 
-  -- Filter by resource name if specified, otherwise get all resources
-  local filter = {position = position, radius = 3, type = "resource"}
-  if resource_name then filter.name = resource_name end
+  -- Filter by resource name if specified, otherwise get all resources. A named token is
+  -- resolved through u.resource_filter so "wood"/"tree" seeds the pool by type = "tree"
+  -- rather than by a name no tree prototype actually has.
+  local filter = {position = position, radius = 3}
+  if resource_name then
+    for k, v in pairs(u.resource_filter(resource_name)) do filter[k] = v end
+  else
+    filter.type = "resource"
+  end
 
   local entities = c.entity.surface.find_entities_filtered(filter)
   if #entities == 0 then return {error = "No resource"} end

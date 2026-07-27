@@ -1,15 +1,12 @@
 -- AI Companion v0.7.0 - World commands
 local u = require("commands.init")
 
-local normalize = {copper = "copper-ore", iron = "iron-ore", coal = "coal", stone = "stone", uranium = "uranium-ore"}
-
 commands.add_command("fac_world_nearest", nil, function(cmd)
   u.safe_command(function()
     local args = u.parse_args("^(%S+)%s+(%S+)$", cmd.parameter)
     local id, c = u.find_companion(args[1])
     if not id then u.error_response("Companion not found"); return end
     local what = args[2]
-    local name = normalize[what] or what
     local pos = c.entity.position
     local surf = c.entity.surface
     -- Same limited-scan defect resource_nearest had: a flat limit=100 over a +/-200 square
@@ -20,8 +17,7 @@ commands.add_command("fac_world_nearest", nil, function(cmd)
       if not wpos then u.json_response({id = id, error = "Not found"}); return end
       u.json_response({id = id, nearest = "water", position = wpos, distance = wmin}); return
     end
-    local filter = (what == "wood" or name == "tree") and {type = "tree"} or {name = name}
-    local closest, min = u.find_nearest(surf, pos, filter)
+    local closest, min = u.find_nearest(surf, pos, u.resource_filter(what))
     if not closest then u.json_response({id = id, error = "Not found"}); return end
     u.json_response({id = id, nearest = closest.name, position = {x = closest.position.x, y = closest.position.y}, distance = min})
   end)

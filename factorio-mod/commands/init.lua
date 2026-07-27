@@ -105,6 +105,26 @@ end
 M.SEARCH_RADII = {8, 16, 32, 64, 128, 200}
 M.SEARCH_MAX_RADIUS = M.SEARCH_RADII[#M.SEARCH_RADII]
 
+M.RESOURCE_ALIASES = {
+  copper = "copper-ore", iron = "iron-ore", coal = "coal",
+  stone = "stone", uranium = "uranium-ore", oil = "crude-oil"
+}
+
+function M.normalize_resource(token)
+  return M.RESOURCE_ALIASES[token] or token
+end
+
+-- Wood is the one harvestable that cannot be selected by name: trees ship dozens of
+-- prototypes (tree-01 .. dead-dry-hairy-tree), so they are selected by TYPE while ores are
+-- selected by name. Callers pass a single token and get the find_entities_filtered fragment
+-- that selects it, which keeps that split in one place instead of at each call site.
+function M.is_wood(token) return token == "wood" or token == "tree" end
+
+function M.resource_filter(token)
+  if M.is_wood(token) then return {type = "tree"} end
+  return {name = M.normalize_resource(token)}
+end
+
 local function closest_of(items, pos, position_of)
   local best, min = nil, math.huge
   for _, item in ipairs(items) do
