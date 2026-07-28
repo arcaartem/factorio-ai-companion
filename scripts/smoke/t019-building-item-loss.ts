@@ -106,12 +106,17 @@ async function main() {
     if (scan.count > 0) {
       console.log(
         `WARNING: ${scan.count} container(s) already within radius 6 of the companion. ` +
-          `building_empty scans the same radius and could pick these up too, which would corrupt the extracted count.`
+          `building_empty scans radius 3 from the companion and could pick one of these instead, which would corrupt the extracted count.`
       );
     }
 
     console.log("\n=== 1a setup: place a wooden-chest with 50 iron-plate ===");
-    const chestX = px + 3;
+    // +2, not +3: building_empty searches radius 3 from the COMPANION, and create_entity snaps a
+    // chest to its tile centre - so a nominal 3-tile offset lands at 3.0117 once the companion is
+    // at a fractional position, i.e. outside the search. This sat on the boundary undetected for
+    // as long as companion_position floored its reply to 1dp (which made the offset read as
+    // exactly 3.0000); T-046 removing that truncation is what tipped it over. Keep the margin.
+    const chestX = px + 2;
     const chestY = py;
     const placeRaw = await silent(
       rcon,
@@ -126,6 +131,15 @@ async function main() {
     const place = JSON.parse(placeRaw);
     console.log("Chest placed ->", JSON.stringify(place));
     check("1a setup: chest created holding 50 iron-plate", place.created === true && place.iron === 50, JSON.stringify(place));
+
+    // Assert the precondition the whole section rests on, rather than assuming the offset holds
+    // after the engine's tile snap. Without this, an out-of-range chest presents as a code failure.
+    const chestDist = Math.hypot(place.x - px, place.y - py);
+    check(
+      "1a setup: the chest is inside building_empty's radius-3 search of the companion",
+      chestDist < 3,
+      `companion=(${px}, ${py}) chest=(${place.x}, ${place.y}) distance=${chestDist.toFixed(4)}`
+    );
 
     console.log("\n=== 1a: building_empty(iron-plate, count=50) ===");
     const emptyRes = await callTool(mcp.client, "building_empty", { companionId: 1, itemName: "iron-plate", count: 50 });

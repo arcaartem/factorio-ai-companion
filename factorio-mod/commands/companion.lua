@@ -9,7 +9,7 @@ commands.add_command("fac_companion_list", nil, function(cmd)
         local pos = c.entity.position
         list[#list + 1] = {
           id = id,
-          position = {x = math.floor(pos.x * 10) / 10, y = math.floor(pos.y * 10) / 10},
+          position = {x = pos.x, y = pos.y},
           health = math.floor(c.entity.health / c.entity.max_health * 100),
           name = c.name
         }
@@ -87,7 +87,7 @@ commands.add_command("fac_companion_position", nil, function(cmd)
         if d < 100 then players[#players + 1] = {name = p.name, distance = math.floor(d)} end
       end
     end
-    u.json_response({id = id, position = {x = math.floor(pos.x * 10) / 10, y = math.floor(pos.y * 10) / 10}, nearby = summary, players = players})
+    u.json_response({id = id, position = {x = pos.x, y = pos.y}, nearby = summary, players = players})
   end)
 end)
 

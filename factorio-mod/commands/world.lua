@@ -36,7 +36,7 @@ commands.add_command("fac_world_scan", nil, function(cmd)
     local result = {}
     for _, e in ipairs(es) do
       if e.valid and e ~= c.entity then
-        local r = {name = e.name, type = e.type, position = {x = math.floor(e.position.x * 10) / 10, y = math.floor(e.position.y * 10) / 10}}
+        local r = {name = e.name, type = e.type, position = {x = e.position.x, y = e.position.y}}
         if e.health then r.health = e.health end
         result[#result + 1] = r
       end

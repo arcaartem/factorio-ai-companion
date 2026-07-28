@@ -23,7 +23,7 @@ commands.add_command("fac_world_enemies", nil, function(cmd)
         result[#result + 1] = {
           name = e.name,
           type = e.type,
-          position = {x = math.floor(e.position.x), y = math.floor(e.position.y)},
+          position = {x = e.position.x, y = e.position.y},
           health = e.health,
           max_health = e.max_health,
           distance = math.floor(u.distance(c.entity.position, e.position))

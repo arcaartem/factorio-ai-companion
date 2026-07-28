@@ -1,4 +1,32 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.20.3
+Date: 2026-07-28
+  Bugfixes:
+    - companion_position (and the position field companion_list embeds) reported
+      math.floor(pos.x * 10) / 10 - truncated to one decimal place, not rounded - which live-probed
+      a 0.103-tile error against the companion's true position (matched by unit_number, so it
+      wasn't a stale-entity artifact). Both handlers now report the entity's exact pos.x/pos.y.
+      The same truncation was also flooring reported positions in world_scan, world_enemies and
+      resource_list; all three now report exact coordinates too. Health percentages, on-screen
+      distances and progress percentages floor by design and are untouched.
+    - building_empty / building_fill could resolve a spilled item-on-ground entity as the
+      "container" - resolve_target picks the nearest surviving match by name/force alone, with no
+      requirement that it actually have an inventory the transfer loop can use. Live evidence:
+      building_empty returned {"extracted":0,"entity":"item-on-ground"} while a chest one tile away
+      still held 50 untouched plates. Both call sites now pass a predicate requiring at least one
+      of the inventory indices the loop actually reads/writes (empty: chest, furnace_result,
+      assembling_machine_output; fill: chest, furnace_source, assembling_machine_input), so an
+      item-on-ground entity - which has none of them - is never picked. Each not_found message now
+      names the real problem ("No container with an output/input inventory found") instead of a
+      generic "Not found"/"Could not insert".
+    - building_empty stopped reporting `full` when the COMPANION, not the container, was the
+      limiting factor. T-019 (0.13.5) added that flag; the 0.19.0 single-target refactor dropped
+      it along with the fan-out sweep it was set inside, so a caller saw {"extracted":5} against a
+      request of 50 with nothing to distinguish "your inventory is full" from "the chest only had
+      5". Restored: `want` is already capped at what the container holds, so a short accept means
+      the companion refused the remainder. building_remove's equivalent flag was never affected.
+
+---------------------------------------------------------------------------------------------------
 Version: 0.20.2
 Date: 2026-07-28
   Bugfixes:

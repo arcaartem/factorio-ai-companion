@@ -193,8 +193,18 @@ commands.add_command("fac_building_empty", nil, function(cmd)
     -- include neutral so crash-site wreckage and other unowned containers are reachable;
     -- excluding characters (resolve_target's default) closes the hole where an unrestricted
     -- radius-5 search could drain the player's own main inventory
+    -- Without a predicate, resolve_target can pick the nearest surviving entity regardless of
+    -- whether it has any of the inventories the transfer loop below actually reads - a spilled
+    -- item-on-ground entity resolves as readily as the chest it's lying next to, and the loop
+    -- then finds nothing to extract from it. Require at least one of the loop's own indices.
     local t, err = u.resolve_target(id, c, pos, {
-      name = entity_name, force = {c.entity.force, "neutral"}, radius = 3, not_found = "Not found"
+      name = entity_name, force = {c.entity.force, "neutral"}, radius = 3,
+      predicate = function(e)
+        return e.get_inventory(defines.inventory.chest) ~= nil
+            or e.get_inventory(defines.inventory.furnace_result) ~= nil
+            or e.get_inventory(defines.inventory.assembling_machine_output) ~= nil
+      end,
+      not_found = "No container with an output inventory found"
     })
     if not t then u.json_response(err); return end
 
@@ -207,6 +217,11 @@ commands.add_command("fac_building_empty", nil, function(cmd)
     end
 
     local ext = 0
+    -- `full` is the caller's only explicit signal that the companion, not the container, was the
+    -- limiting factor - `extracted < count` alone cannot distinguish "you are full" from "the
+    -- chest only had that many". T-019 (0.13.5) added it; the 0.19.0 single-target refactor
+    -- dropped it with the fan-out sweep it used to be set in, which t019 caught.
+    local full = false
     -- ext is an upvalue: even if this raises partway through, whatever was already
     -- transferred before the failing statement stays counted below, rather than lost.
     local ok, transfer_err = pcall(function()
@@ -221,6 +236,9 @@ commands.add_command("fac_building_empty", nil, function(cmd)
             -- shortfall is destroyed outright when its inventory is full
             local acc = c.entity.insert{name = item, count = want}
             if acc > 0 then inv.remove{name = item, count = acc}; ext = ext + acc end
+            -- want is already capped at what the container holds, so a short accept means the
+            -- COMPANION refused the remainder.
+            if acc < want then full = true end
           end
         end
         if ext >= count then break end
@@ -229,6 +247,7 @@ commands.add_command("fac_building_empty", nil, function(cmd)
 
     local result = {id = id, extracted = ext, item = item, entity = t.name,
       position = {x = t.position.x, y = t.position.y}}
+    if full then result.full = true end
     if not ok then result.error = tostring(transfer_err) end
     u.json_response(result)
   end)
@@ -251,8 +270,17 @@ commands.add_command("fac_building_fill", nil, function(cmd)
     local inv = c.entity.get_inventory(defines.inventory.character_main)
     local have = inv.get_item_count(item)
     if have == 0 then u.json_response({id = id, error = "No " .. item}); return end
+    -- Same target-resolution gap as building_empty: without a predicate, a nearby item-on-ground
+    -- entity can resolve ahead of the actual container, and t.insert{} then has nowhere to put
+    -- anything. Require one of the input-side inventories t.insert{} can actually reach.
     local t, err = u.resolve_target(id, c, pos, {
-      name = entity_name, force = c.entity.force, radius = 3, not_found = "Could not insert"
+      name = entity_name, force = c.entity.force, radius = 3,
+      predicate = function(e)
+        return e.get_inventory(defines.inventory.chest) ~= nil
+            or e.get_inventory(defines.inventory.assembling_machine_input) ~= nil
+            or e.get_inventory(defines.inventory.furnace_source) ~= nil
+      end,
+      not_found = "No container with an input inventory found"
     })
     if not t then u.json_response(err); return end
     local ins = t.insert{name = item, count = math.min(count, have)}

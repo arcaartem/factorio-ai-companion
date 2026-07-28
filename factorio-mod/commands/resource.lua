@@ -17,7 +17,7 @@ commands.add_command("fac_resource_list", nil, function(cmd)
     local found = {}
     for _, r in ipairs(res) do
       if not filter or r.name == filter then
-        found[#found + 1] = {name = r.name, position = {x = math.floor(r.position.x), y = math.floor(r.position.y)}, amount = r.amount, distance = math.floor(u.distance(pos, r.position))}
+        found[#found + 1] = {name = r.name, position = {x = r.position.x, y = r.position.y}, amount = r.amount, distance = math.floor(u.distance(pos, r.position))}
       end
     end
     table.sort(found, function(a, b) return a.distance < b.distance end)
