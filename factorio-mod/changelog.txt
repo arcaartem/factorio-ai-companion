@@ -19,8 +19,11 @@ Date: 2026-07-28
       buildings and drain the companion's inventory retrying at a dead coordinate. Every building
       command below now goes through the new u.resolve_target helper, which picks the nearest
       surviving match by distance (find_entities_filtered's order is engine chunk order, not
-      distance order - the old `es[1]` pick was arbitrary) and checks reach against the resolved
-      entity's position rather than the requested point
+      distance order - the old `es[1]` pick was arbitrary) and, for every command that ACTS on the
+      entity, checks reach against the resolved entity's position rather than the requested point.
+      building_info is the one deliberate exception: it passes reach = false, because a read-only
+      inspection is not an action - the carve-out is an explicit argument at the call site rather
+      than an omission
     - fuel/fill/empty checked reach against the requested x/y instead of the entity they ended up
       acting on, so a companion could be told "too far" for an entity that was actually in range,
       or vice versa. Fixed via the same resolve_target path
