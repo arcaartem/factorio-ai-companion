@@ -203,6 +203,19 @@ while `queues.lua`/`init.lua`/`companion.lua` predated the fixes they were suppo
   the entity, so it finally agrees with `building_info`; they previously disagreed on units (south
   was `2` from rotate, `8` from info). `LuaEntity.rotatable` exists; `LuaEntityPrototype` has no
   such key.
+- **`rotatable` is not "can this be rotated" — `supports_direction` is. Live-probed across 34 base
+  prototypes: `LuaEntity.rotatable` was `true` for every one**, wooden/iron/steel chest, lab, radar,
+  every electric pole, pipe, gun turret, solar panel, accumulator and substation included. It is a
+  per-instance "can the player press R on it" permission seeded from the `not-rotatable` entity
+  flag, which base data sets on almost nothing (character corpses, crash-site wreckage).
+  `prototypes.entity[n].supports_direction` is the property that actually discriminates — false for
+  13 of those 34. So a predicate filtering on `e.rotatable` filters essentially nothing while
+  reading like a gate, which is what it did in `building_rotate` until 0.20.2. Two further traps
+  the same probe settled, both of which look like the other from the reply alone: `stone-furnace`
+  has `supports_direction` **true**, so rotating one reaches the assign→read-back comparison and
+  returns `"Rotate had no effect"` — *not* the `supports_direction` refusal, which is what a
+  wooden-chest gets. And deriving either fact from base data or the forums gets it wrong; a code
+  read predicted `stone-furnace` false and the engine said true.
 - **`building_place` reports where the entity actually landed.** It used `create_entity`'s return
   value as a bare truthiness test, so a caller never learned the snapped centre (a 3x2 boiler
   requested at `(9.5, 32.5)` seats at `(9.5, 32)`) and had nothing but its own coordinates to hand

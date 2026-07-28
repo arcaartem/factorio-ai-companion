@@ -1,4 +1,19 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.20.2
+Date: 2026-07-28
+  Bugfixes:
+    - building_rotate's target predicate filtered on e.rotatable, which live-probed true for
+      every entity checked (chests, poles, labs included) - it filtered nothing while implying
+      a gate that doesn't exist. The real gate is the supports_direction check already further
+      down the same handler. The predicate is removed, and the not_found message ("No rotatable
+      entity") is renamed to "No entity found" since it mislabelled the commonest case - nothing
+      at those coordinates - as a rotatability problem.
+    - The "Entity does not support direction" refusal in the same handler carried no `position`,
+      the only building_rotate payload missing it - with entityName omitted there's no name
+      filter at radius 1, so a caller couldn't tell which nearby entity was actually resolved.
+      It now reports `position` like every other branch in the handler.
+
+---------------------------------------------------------------------------------------------------
 Version: 0.20.1
 Date: 2026-07-28
   Bugfixes:

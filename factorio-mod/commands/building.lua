@@ -81,14 +81,17 @@ commands.add_command("fac_building_rotate", nil, function(cmd)
     if not dir or dir < 0 or dir > 3 then
       u.json_response({id = id, error = "Invalid direction", direction = dir, valid = "0-3"}); return
     end
+    -- No predicate here: e.rotatable is true for every entity probed (chests, poles, labs
+    -- included), so it filtered nothing while implying a gate that doesn't exist. The real
+    -- gate is the supports_direction check below, which is reachable without it.
     local t, err = u.resolve_target(id, c, {x=x, y=y}, {
       name = entity_name, force = c.entity.force, radius = 1,
-      predicate = function(e) return e.rotatable end,
-      not_found = "No rotatable entity"
+      not_found = "No entity found"
     })
     if not t then u.json_response(err); return end
     if not prototypes.entity[t.name].supports_direction then
-      u.json_response({id = id, error = "Entity does not support direction", entity = t.name}); return
+      u.json_response({id = id, error = "Entity does not support direction", entity = t.name,
+        position = {x = t.position.x, y = t.position.y}}); return
     end
     local want = u.dir_map[dir]
     t.direction = want

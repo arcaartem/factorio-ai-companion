@@ -490,18 +490,85 @@ async function main(): Promise<void> {
     });
 
     // ================================================================================
-    await section("7", "T-039 rotate: a non-rotatable entity refuses instead of no-op-succeeding", async () => {
+    // T-039 follow-up: e.rotatable was probed true for EVERY entity (chests, poles, labs
+    // included) and filtered nothing, so it's gone from resolve_target's predicate; the real
+    // gate is the supports_direction check further down the handler. This section proves the
+    // three distinct refusals (unrotatable entity, no-op assign, nothing found) are each pinned
+    // to their own exact error string rather than accepted by a generic "reply has an error".
+    await section("7", "T-039 rotate: three distinct refusals, each pinned to its exact error string, plus a positive control", async () => {
       const arena = { x: base.x + 150, y: base.y + 10 };
       await teleportCompanion(rcon, ID, arena.x, arena.y);
 
-      const furnace = await createEntity(rcon, "stone-furnace", arena);
+      // 7a - genuinely unrotatable entity (supports_direction === false).
+      const chest = await createEntity(rcon, "wooden-chest", arena);
+      if (chest.created) placed.push({ name: "wooden-chest", x: chest.x, y: chest.y });
+      check("7a setup: wooden-chest placed", chest.created, JSON.stringify(chest));
+      if (!chest.created) return;
+
+      const chestSupportsDirection = await lua(rcon, `rcon.print(helpers.table_to_json({supports = prototypes.entity["wooden-chest"].supports_direction}))`);
+      check("7a setup: wooden-chest's own prototype confirms supports_direction === false (not assumed)", chestSupportsDirection.supports === false, JSON.stringify(chestSupportsDirection));
+
+      const rotateChest = await callTool(mcp.client, "building_rotate", { companionId: ID, x: chest.x, y: chest.y, direction: 1 });
+      console.log("building_rotate(wooden-chest) ->", JSON.stringify(rotateChest));
+      check("7a.1: exact error 'Entity does not support direction'", rotateChest?.error === "Entity does not support direction", JSON.stringify(rotateChest));
+      check("7a.2: reply names the entity", rotateChest?.entity === "wooden-chest", JSON.stringify(rotateChest));
+      check("7a.3: no `rotated` field on a refusal", rotateChest?.rotated === undefined, JSON.stringify(rotateChest));
+      // With entityName omitted there's no name filter at radius 1, so `position` is what proves
+      // WHICH nearby entity resolve_target actually picked - not just that something refused.
+      check("7a.4: reply carries `position` matching the resolved chest", rotateChest?.position && dist(rotateChest.position, chest) < POS_EPS, JSON.stringify(rotateChest?.position));
+
+      const chestTruth = await lua(rcon, `
+        local es = game.surfaces[1].find_entities_filtered{name = "wooden-chest", position = {x=${chest.x}, y=${chest.y}}, radius = 0.6}
+        rcon.print(helpers.table_to_json({direction = es[1] and es[1].direction}))
+      `);
+      check("7a.5 DECISIVE: the chest's real direction is unchanged (still 0)", chestTruth.direction === 0, JSON.stringify(chestTruth));
+
+      // 7b - supports_direction is true, but the assign is a no-op (this is what the old
+      // section actually exercised, under a misleading "not rotatable" label). This reaches
+      // the assign -> read-back -> compare path, NOT the supports_direction guard above.
+      const furnace = await createEntity(rcon, "stone-furnace", { x: arena.x + 3, y: arena.y });
       if (furnace.created) placed.push({ name: "stone-furnace", x: furnace.x, y: furnace.y });
-      check("7 setup: stone-furnace placed", furnace.created, JSON.stringify(furnace));
+      check("7b setup: stone-furnace placed", furnace.created, JSON.stringify(furnace));
       if (!furnace.created) return;
 
-      const rotate = await callTool(mcp.client, "building_rotate", { companionId: ID, x: furnace.x, y: furnace.y, direction: 1 });
-      console.log("building_rotate(stone-furnace) ->", JSON.stringify(rotate));
-      check("7.1: reply is an error, not a success (stone-furnace is not rotatable)", typeof rotate?.error === "string" && rotate?.rotated === undefined, JSON.stringify(rotate));
+      const rotateFurnace = await callTool(mcp.client, "building_rotate", { companionId: ID, x: furnace.x, y: furnace.y, direction: 1 });
+      console.log("building_rotate(stone-furnace) ->", JSON.stringify(rotateFurnace));
+      check("7b.1: exact error 'Rotate had no effect'", rotateFurnace?.error === "Rotate had no effect", JSON.stringify(rotateFurnace));
+      check("7b.2: reply carries `direction` (read-back) and `requested`, and they DIFFER", typeof rotateFurnace?.direction === "number" && typeof rotateFurnace?.requested === "number" && rotateFurnace.direction !== rotateFurnace.requested, JSON.stringify(rotateFurnace));
+
+      const furnaceTruth = await lua(rcon, `
+        local es = game.surfaces[1].find_entities_filtered{name = "stone-furnace", position = {x=${furnace.x}, y=${furnace.y}}, radius = 0.6}
+        rcon.print(helpers.table_to_json({direction = es[1] and es[1].direction}))
+      `);
+      check("7b.3 DECISIVE: the furnace's real direction is unchanged (matches the reply's read-back)", furnaceTruth.direction === rotateFurnace?.direction, JSON.stringify(furnaceTruth));
+
+      // 7c - nothing at the coordinates at all. Offset well clear of the chest/furnace just
+      // placed; verify empty first so this can't accidentally resolve one of them.
+      const emptySpot = { x: arena.x - 6, y: arena.y - 6 };
+      const emptyCheck = await lua(rcon, `rcon.print(helpers.table_to_json({n = #game.surfaces[1].find_entities_filtered{position = {x=${emptySpot.x}, y=${emptySpot.y}}, radius = 1}}))`);
+      check("7c setup: nothing within radius 1 of the empty spot", emptyCheck.n === 0, JSON.stringify(emptyCheck));
+
+      const rotateEmpty = await callTool(mcp.client, "building_rotate", { companionId: ID, x: emptySpot.x, y: emptySpot.y, direction: 1 });
+      console.log("building_rotate(empty spot) ->", JSON.stringify(rotateEmpty));
+      check("7c.1: exact error 'No entity found' - proves 7a's refusal is specific, not a generic failure", rotateEmpty?.error === "No entity found", JSON.stringify(rotateEmpty));
+
+      // 7d - positive control: without this, 7a-7c could all pass on a command that refuses
+      // everything.
+      const inserter = await createEntity(rcon, "inserter", { x: arena.x - 3, y: arena.y }, dirs.north);
+      if (inserter.created) placed.push({ name: "inserter", x: inserter.x, y: inserter.y });
+      check("7d setup: inserter placed facing north", inserter.created && inserter.direction === dirs.north, JSON.stringify(inserter));
+      if (!inserter.created) return;
+
+      const rotateInserter = await callTool(mcp.client, "building_rotate", { companionId: ID, x: inserter.x, y: inserter.y, direction: 1 });
+      console.log("building_rotate(inserter) ->", JSON.stringify(rotateInserter));
+      check("7d.1: rotated === true", rotateInserter?.rotated === true, JSON.stringify(rotateInserter));
+      check("7d.2: reply's `direction` equals the live-fetched east", rotateInserter?.direction === dirs.east, `reply direction=${rotateInserter?.direction} expected=${dirs.east}`);
+
+      const inserterTruth = await lua(rcon, `
+        local es = game.surfaces[1].find_entities_filtered{name = "inserter", position = {x=${inserter.x}, y=${inserter.y}}, radius = 0.6}
+        rcon.print(helpers.table_to_json({direction = es[1] and es[1].direction}))
+      `);
+      check("7d.3 DECISIVE: the inserter's real direction (read back independently) equals east", inserterTruth.direction === dirs.east, JSON.stringify(inserterTruth));
     });
 
     // ================================================================================
