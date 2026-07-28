@@ -143,15 +143,47 @@ while `queues.lua`/`init.lua`/`companion.lua` predated the fixes they were suppo
   `direction` fully controls it, so a shore whose output tile is water just needs the pump turned;
   `building_place`'s direction argument is the lever, and passing `0` to every call (as the T-001
   probes initially did) makes the output look fixed.
-- **Three commands report an outcome that doesn't match reality** (open cards, so don't trust their
-  replies as evidence): `building_rotate` returns `{rotated, direction}` while the entity never
-  turns (T-039); `building_empty` returned `{error="count must be positive"}` while extracting all
-  45 plates, suspected negative-coordinate arg mis-binding (T-040); and `building_remove` resolves
-  at the *requested* coordinates while Factorio snaps entities elsewhere, so a place/inspect/remove
-  search loop silently strands buildings and drains the companion's inventory until further
-  placements fail `{"error":"Not in inventory"}` — which presents as "no valid position exists"
-  (T-041). Remove at the entity's **actual** position from the inspect step, and sweep for strays
-  before reporting a result.
+- **Every coordinate-addressed building command resolves through `u.resolve_target` (mod 0.19.0) —
+  route new ones through it too.** All six used to pick `es[1]` out of `find_entities_filtered`,
+  which is the engine's **chunk order, not distance order**, so they acted on an arbitrary nearby
+  entity and never said which: fuelling a furnace put coal in a drill 2.5 tiles away. The helper
+  (`commands/init.lua`) takes `{name, type, force, radius, predicate, not_found, reach,
+  reach_kind, allow_characters}`, picks the **nearest** survivor, excludes `type == "character"` by
+  default, and checks reach against the **resolved entity** — `fill`/`empty` used to check the
+  *requested point*, giving them effective reach 13 and 15 against a limit of 10. Every success
+  payload now carries the `entity` and `position` actually acted on; use those rather than assuming
+  your request was honoured. Two behaviour changes came with it: `fill`/`empty` act on ONE entity
+  instead of fanning out across every match until the count is satisfied, and `fill` is restricted
+  to the companion's own force, so neutral wreckage can no longer be filled (`empty` still reads it).
+- **`defines.inventory` constants ALIAS to the same integers** — live-probed: `chest`,
+  `character_main` and `fuel` are all **1**; `furnace_result` and `assembling_machine_output` are
+  both **3**. Two traps follow. A "list of inventories to try" like `{chest, furnace_result,
+  assembling_machine_output}` is really `{1, 3, 3}` and visits index 3 twice — which is what made
+  `building_empty` reply `{error="count must be positive"}` while successfully extracting all 45
+  plates (the second visit computed `want = 0` and `insert{count = 0}` *raises*, after the items
+  moved). De-dup through a `seen` set. And because `chest == character_main`, a container search
+  filtered only by force will drain the player's or another companion's inventory — filter by type
+  or exclude characters. Note the engine's message points at the argument, not the loop, which is
+  why T-040's card blamed argument parsing for four months; the same `count <= 0` trap also lived
+  unreported in `building_fill` (`0` is truthy in Lua, so it survives `tonumber(...) or 10`).
+- **`building_rotate` verifies rather than asserts (mod 0.19.0).** It used to return
+  `{rotated, direction}` unconditionally with `direction` being the *requested* argument, so the
+  reply could be true about a different entity than you meant. It now validates the index to 0-3
+  (`u.dir_map[7]` was nil and silently became north while echoing back `7`), pre-checks
+  `prototypes.entity[n].supports_direction`, then assigns, reads back and compares — erroring
+  `"Rotate had no effect"` on mismatch. Its `direction` is now the raw `defines.direction` read off
+  the entity, so it finally agrees with `building_info`; they previously disagreed on units (south
+  was `2` from rotate, `8` from info). `LuaEntity.rotatable` exists; `LuaEntityPrototype` has no
+  such key.
+- **`building_place` reports where the entity actually landed.** It used `create_entity`'s return
+  value as a bare truthiness test, so a caller never learned the snapped centre (a 3x2 boiler
+  requested at `(9.5, 32.5)` seats at `(9.5, 32)`) and had nothing but its own coordinates to hand
+  to `remove` — that, not `remove` itself, was the real cause of place/inspect/remove loops
+  stranding buildings and draining the inventory until placements failed `{"error":"Not in
+  inventory"}`. `place` now returns the real `position`/`direction`, and the async path records the
+  same in `storage.build_results` (reasons `placed`/`blocked`/`stopped`) because the build queue is
+  pruned on the same tick `create_entity` runs — the same outcome-before-deletion rule the harvest
+  and combat queues follow.
 - **Wood is selected by TYPE, not name (mod 0.18.0).** Trees ship dozens of prototypes (`tree-01`
   … `dead-dry-hairy-tree`), so `{name = "wood"}` matches nothing — asking for wood before 0.18.0
   returned `{error = "No resource"}` because `fac_resource_mine` and `queues.start_harvest` both
