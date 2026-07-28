@@ -1,4 +1,4 @@
--- AI Companion v0.19.0
+-- AI Companion v0.20.0
 local M = {}
 
 M.COLORS = {

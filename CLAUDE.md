@@ -32,7 +32,7 @@ Categories:
 - `resource_*` - nearest, list, mine, mine_until (skill)
 - `item_*` - pick, craft, recipes
 - `building_*` - place, remove, info, rotate, fuel, fill, empty
-- `action_*` - attack, flee, patrol, wololo
+- `action_*` - attack, flee, patrol
 - `research_*` - get, set, progress
 - `world_*` - scan, scan_enemies, nearest
 - `context_*` - clear, check
@@ -116,6 +116,24 @@ while `queues.lua`/`init.lua`/`companion.lua` predated the fixes they were suppo
 - **Background skills report through logs and exit codes:** skill processes write stdout/stderr to `.fac-skills/<id>-<skill>-<ts>.log`, end with a `SKILL_RESULT {json}` line, and exit nonzero on failure. `companion_status` / `session_status` expose the last run's exit code and log path — check them (or Read the log) instead of inferring outcomes from chat.
 - **Companions are controllerless characters:** they have `begin_crafting` / `get_craftable_count` (LuaControl) but NOT `can_craft` (LuaPlayer). Their crafting queue does run to completion unattended.
 - **Reach limits are ALWAYS on (mod 0.15.0) and the engine reach properties read fine on a companion** — live-probed identical to the player's: `reach_distance`/`build_distance` 10, `resource_reach_distance` **2.7**, `item_pickup_distance` 1, `loot_pickup_distance` 2. `check_reach` (`init.lua`) is the single source of truth; there is no `companion_realistic` flag any more. One trap remains: the refusal payload's `reach` field is `math.floor(limit + 0.5)`, so it displays **3** for the real 2.7 — never threshold against it. (`fac_resource_nearest` used to floor its coordinates too, spending ~0.71 tiles of that 2.7-tile budget before you moved; fixed in 0.17.0, it now returns the entity's exact tile-centre position.)
+- **Reach binds ACTIONS, not QUERIES — read-only, companion-centred queries are deliberately
+  unbounded.** `world_scan`, `world_enemies`, `resource_list`, `resource_nearest`, `world_nearest`,
+  `companion_position`, `companion_health` and `building_info` all read at arbitrary range on
+  purpose: looking at something is not acting on it, the player has map view and a minimap, and
+  binding them would mostly force pointless walking before every decision. Two rules follow when
+  you add a query. First, say so explicitly rather than by omission — `building_info` passes
+  `reach = false` to `u.resolve_target` at its call site, which is why the exemption survives an
+  audit; a query that simply never calls `check_reach` reads as a bug. Second, **the exemption is
+  for the RANGE only, not for the other resolution guarantees** — a read-only command must still
+  resolve nearest-not-`es[1]` and still exclude characters, because `defines.inventory.chest ==
+  character_main` means an unfiltered container read reports the *player's* inventory as "the
+  chest". Anything that mutates the world stays bound, no exceptions.
+- **A capability that cannot be bounded to player parity is REMOVED, not reach-limited (mod
+  0.20.0).** `action_wololo` converted an enemy — including a nest, permanently and for free — at
+  radius 25. There is no player action that converts an enemy at *any* distance, so no radius makes
+  it parity-legal; bounding it would only have produced a cheat you have to stand next to. It is
+  gone: command, MCP tool, help entry and sound prototype (the orphaned `sounds/wololo.ogg` is left
+  on disk, since this repo is a fork with a live `upstream`). The tool surface is now **51 = 51**.
 - **Mining out of reach was always a silent no-op, never a hang.** Before 0.15.0 an out-of-range `resource_mine` was accepted (`{mining:true, entities:12}`), harvested nothing because the *engine* refuses past 2.7, and self-terminated in ~1s. Building out of reach, by contrast, genuinely worked — `create_entity` is not engine-bounded — so 0.15.0 removes a real capability there and only adds a structured error for mining.
 - **A character whose `mining_state.mining` is true CANNOT walk — the engine reverts `walking_state` every tick** (mod 0.16.0 / T-031). Live-probed: `tick_walk_queues` runs last and wrote `walking = true` on every tick, yet the engine read back `walking = false` in 20/20 samples with **0.000 tiles** moved; the same walk with no harvest queue covered 14.1 tiles in ~2s. Clearing `mining_state` un-pins it within 2 ticks and the standing walk queue resumes unaided. So mining and moving are mutually exclusive: `tick_harvest_queues` **yields** — clears `mining_state`, keeps the queue, re-asserts on the same entity afterwards — whenever a walk or combat queue is actively moving the companion. It deliberately does **not** yield to a walk queue latched at `no_path`/`stuck`, which would swap one permanent deadlock for another. This is invisible from the code: it reads exactly like a tick-ordering bug, so settle it by reading the engine's own state back off the character, not by reasoning about `queues.lua`.
 - **`mining_state.mining` never goes false while the ore tile still has ore**, so any "mining stopped → count it" guard is dead code. A resource entity decrements `amount` (hundreds of ore per tile) rather than being consumed per ore; probed true in 20/20 samples over 10s while 5 ore were produced. This is what pinned `harvested` at 0 for four releases. Count a real main-inventory delta **every tick**, resetting the snapshot each time (or you double-count); advance to the next tile on `q.current.entity.valid` going false, not on `mining_state`. There is no `on_player_mined_entity` handler and adding one would not help — a controllerless character raises no player-mined events.

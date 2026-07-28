@@ -1,4 +1,18 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.20.0
+Date: 2026-07-28
+  Changes:
+    - Removed the wololo command (fac_action_wololo / action_wololo). There is no player action
+      that converts an enemy at any distance, so it could not be brought to player parity by
+      bounding its radius the way other companion abilities were. It also converted a
+      unit-spawner (a nest) permanently and for free, a capability the player never has at all.
+      Per the project's standing rule - companion gameplay must obey the same constraints as the
+      player, and a capability that can't be bounded to parity gets removed rather than
+      reach-limited - the command, its MCP tool entry, its help listing, and its
+      ai-companion-wololo sound prototype are all removed. sounds/wololo.ogg is left on disk,
+      now unused by data.lua
+
+---------------------------------------------------------------------------------------------------
 Version: 0.19.0
 Date: 2026-07-28
   Bugfixes:

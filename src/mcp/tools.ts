@@ -366,12 +366,6 @@ export const TOOLS: Record<string, {
       points: { type: "string", desc: "JSON array of {x,y} points", required: true }
     }
   },
-  action_wololo: {
-    desc: "Play wololo sound",
-    rcon: "/fac_action_wololo {companionId}",
-    params: { companionId: { type: "number", required: true } }
-  },
-
   // Research
   research_get: {
     desc: "Get current research status",

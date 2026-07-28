@@ -116,7 +116,7 @@ export class FactorioMCPServer {
       // Tools that require stopping active skills before execution
       const AUTO_STOP_TOOLS = [
         'move_to', 'move_follow',
-        'action_attack', 'action_flee', 'action_patrol', 'action_wololo'
+        'action_attack', 'action_flee', 'action_patrol'
       ];
       // ...of which these supersede an existing walk on their own; the rest want it cleared.
       const SELF_SUPERSEDING_MOVE_TOOLS = ['move_to', 'move_follow'];

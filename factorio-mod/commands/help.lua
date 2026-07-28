@@ -12,9 +12,9 @@ commands.add_command("fac_help", nil, function()
   local version = script.active_mods["ai-companion"] or "unknown"
   u.json_response({
     version = version,
-    commands = 50,
+    commands = 51,
     categories = {"action", "building", "chat", "companion", "context", "item", "move", "research", "resource", "world"},
-    action = {"attack", "flee", "patrol", "wololo"},
+    action = {"attack", "flee", "patrol"},
     building = {"can_place", "empty", "fill", "fuel", "info", "place", "recipe", "remove", "rotate"},
     chat = {"get", "say"},
     companion = {"disappear", "health", "inventory", "position", "spawn"},
