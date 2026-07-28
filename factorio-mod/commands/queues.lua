@@ -615,7 +615,11 @@ local function finish_build(cid, q, c, placed_entity, reason)
   storage.build_results = storage.build_results or {}
   -- create_entity can snap to a different tile than requested - report the real position
   -- when something was actually placed, the request otherwise (nothing to report instead).
-  local position = placed_entity and {x = placed_entity.position.x, y = placed_entity.position.y} or q.position
+  -- Copy q.position rather than aliasing it: q is discarded right after this runs, but nothing
+  -- guarantees a caller holding the returned table won't outlive that - the on_drop branch
+  -- below already copies for the same reason.
+  local position = placed_entity and {x = placed_entity.position.x, y = placed_entity.position.y}
+    or {x = q.position.x, y = q.position.y}
   storage.build_results[cid] = {
     placed = placed_entity ~= nil,
     entity = q.entity,
@@ -663,16 +667,47 @@ function M.tick_build_queues()
   process_queue("build_queues", function(cid, q, c)
     if game.tick - q.tick_start < BUILD_TICKS then return false end
 
-    local placed = c.entity.surface.create_entity{
+    -- start_build's checks (reach, inventory, can_place_entity) only held at queue time - the
+    -- BUILD_TICKS (60) window before this runs is wide enough for a synchronous command
+    -- (fac_building_place, building_fill/fuel, item_craft) to walk the companion out of range,
+    -- occupy the tile, or spend the very item this queue is about to place. None of that is
+    -- re-checked just because it was checked once, so every precondition is re-verified here.
+    if u.check_reach(cid, c, q.position) then
+      return finish_build(cid, q, c, nil, "too_far")
+    end
+
+    local surface = c.entity.surface
+    if not surface.can_place_entity{name = q.entity, position = q.position, direction = q.direction, force = c.entity.force} then
+      return finish_build(cid, q, c, nil, "blocked")
+    end
+
+    -- Debit BEFORE create_entity - the insert-first idiom the rest of the mod uses
+    -- (building.lua's remove/empty/fill) run in reverse: here the source item must be
+    -- confirmed gone before a new entity exists to represent it, or a synchronous spend
+    -- racing this same tick would leave both the new entity AND the original item, i.e.
+    -- conjure one from thin air. get_inventory(character_main), not c.entity.remove_item -
+    -- the latter is not restricted to the main inventory and can also drain gun/ammo slots.
+    local inv = c.entity.get_inventory(defines.inventory.character_main)
+    if inv.remove{name = q.entity, count = 1} < 1 then
+      return finish_build(cid, q, c, nil, "no_item")
+    end
+
+    local placed = surface.create_entity{
       name = q.entity,
       position = q.position,
       direction = q.direction,
       force = c.entity.force
     }
     if placed then
-      c.entity.remove_item{name = q.entity, count = 1}
       return finish_build(cid, q, c, placed, "placed")
     end
+
+    -- create_entity can still fail here despite the can_place_entity check above (something
+    -- else claimed the tile between that check and this call). Refund the debit rather than
+    -- destroying the item outright - trading a conjure bug for a destroy bug would not be a
+    -- fix. Removing exactly 1 above guarantees room for exactly 1 back, so this insert cannot
+    -- fail.
+    inv.insert{name = q.entity, count = 1}
     return finish_build(cid, q, c, nil, "blocked")
   end, function(cid, q)
     -- Companion died/vanished mid-build: persist an outcome before process_queue drops the

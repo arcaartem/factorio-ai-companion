@@ -222,9 +222,34 @@ while `queues.lua`/`init.lua`/`companion.lua` predated the fixes they were suppo
   to `remove` — that, not `remove` itself, was the real cause of place/inspect/remove loops
   stranding buildings and draining the inventory until placements failed `{"error":"Not in
   inventory"}`. `place` now returns the real `position`/`direction`, and the async path records the
-  same in `storage.build_results` (reasons `placed`/`blocked`/`stopped`) because the build queue is
-  pruned on the same tick `create_entity` runs — the same outcome-before-deletion rule the harvest
-  and combat queues follow.
+  same in `storage.build_results` (reasons `placed`/`blocked`/`stopped`/`too_far`/`no_item`) because
+  the build queue is pruned on the same tick `create_entity` runs — the same outcome-before-deletion
+  rule the harvest and combat queues follow.
+- **A deferred action must re-check its preconditions and DEBIT BEFORE it creates (mod 0.20.4).**
+  `tick_build_queues` fires ~60-64 ticks after `start_build` and used to re-check *nothing* — it
+  called `create_entity` first, then `remove_item`, discarding the return. So spending the item
+  inside that window (a synchronous `building_place`, `building_fill`/`fuel`, `item_craft`) still
+  produced the building with nothing debited: **two entities from one item**, violating the
+  never-conjured invariant at `commands/init.lua:277-280`. The synchronous `fac_building_place` has
+  the same create-then-remove order and is *sound anyway*, because all its steps run in one tick
+  with nothing able to interleave — which is exactly why copying the sync path verbatim is the wrong
+  fix, and why "checked once at queue time" is not a check at all. The queue now re-validates reach
+  (`too_far`) and `can_place_entity` (`blocked`), then `inv.remove{count=1}` on
+  `character_main` **with its return inspected** (`no_item`), and only then creates. Two details
+  worth keeping: use `get_inventory(defines.inventory.character_main).remove` rather than
+  `LuaControl::remove_item`, which is not restricted to the main inventory and can drain gun/ammo
+  slots; and the `create_entity`-still-nil path must **refund** the debit, or the fix trades a
+  conjure bug for a destroy bug. `t043` asserts item counts absolutely on that branch for that
+  reason. Still open on the same code: `stop_all` drops the build queue without recording a result
+  (T-049), and none of the `on_nth_tick` queue handlers is `pcall`-protected (T-050).
+- **A smoke suite that only ever ADDS to the companion's inventory will report red against working
+  code.** `t043`'s first live run failed its own conjure section because section 1 left 2 furnaces
+  behind and section 2 added 1 rather than resetting: the queued build fired with items in hand and
+  correctly answered `placed`, so the zero-item path under test was never created. The end-state
+  arithmetic was perfectly conservative — 3 items in, 2 buildings + 1 held — which is the tell that
+  the *harness* was wrong. Reset each section to an absolute count (`setCompanionItems`), assert the
+  precondition exactly, and **return early when a setup assertion fails**: every DECISIVE assertion
+  that ran on top of that broken premise reported a defect that did not exist.
 - **Wood is selected by TYPE, not name (mod 0.18.0).** Trees ship dozens of prototypes (`tree-01`
   … `dead-dry-hairy-tree`), so `{name = "wood"}` matches nothing — asking for wood before 0.18.0
   returned `{error = "No resource"}` because `fac_resource_mine` and `queues.start_harvest` both

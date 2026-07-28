@@ -1,4 +1,20 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.20.4
+Date: 2026-07-28
+  Bugfixes:
+    - The async build queue (fac_building_place_start) could conjure entities: tick_build_queues
+      called create_entity first and then remove_item, discarding remove_item's return, so an
+      item spent during the ~60-tick window by a synchronous command (fac_building_place,
+      building_fill/fuel, item_craft) still produced a placed entity while nothing was debited -
+      two entities from one item. It also re-checked none of start_build's preconditions at fire
+      time. tick_build_queues now re-validates reach and can_place_entity, then debits the item
+      via get_inventory(character_main).remove{} (checking the returned count) BEFORE calling
+      create_entity, refunding the debit if placement still fails afterwards. New build_results
+      reasons "too_far" and "no_item" join the existing "placed"/"blocked"/"stopped". Also fixed:
+      finish_build's non-placed branch returned q.position by reference instead of copying it,
+      the only branch that didn't.
+
+---------------------------------------------------------------------------------------------------
 Version: 0.20.3
 Date: 2026-07-28
   Bugfixes:
