@@ -1,4 +1,20 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.21.1
+Date: 2026-07-28
+  Bugfixes:
+    - fac_companion_stop_all now calls queues.stop_combat unconditionally instead of only when a
+      combat queue exists. 0.21.0 moved the shooting_state clear into stop_combat, ahead of its
+      no-queue early return, specifically so a companion set firing by fac_action_attack could be
+      un-stuck - but stop_all still gated the call on storage.combat_queues[id], which
+      fac_action_attack never creates. The clear was therefore unreachable from the only caller
+      that needed it, and a stop_all after a fac_action_attack left shooting_enemies latched with
+      nothing in the mod able to clear it. The reported `stopped` list still names "combat" only
+      when a queue genuinely existed, so the response contract is unchanged.
+    - queues.stop_combat nil-guards storage.combat_queues rather than indexing it bare. stop_all's
+      old gate incidentally provided that guard; a re-host fires neither on_init nor
+      on_configuration_changed, so M.init() cannot be assumed to have run.
+
+---------------------------------------------------------------------------------------------------
 Version: 0.21.0
 Date: 2026-07-28
   Changes:

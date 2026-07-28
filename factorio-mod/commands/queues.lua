@@ -949,7 +949,10 @@ function M.stop_combat(cid)
   -- place able to clear that latch when there is no queue to find.
   if c then c.entity.shooting_state = {state = defines.shooting.not_shooting} end
 
-  local q = storage.combat_queues[cid]
+  -- Nil-guarded, not indexed bare: fac_companion_stop_all now calls this unconditionally, and
+  -- a re-host fires neither on_init nor on_configuration_changed, so M.init() may not have run
+  -- against an older save.
+  local q = storage.combat_queues and storage.combat_queues[cid]
   if not q then
     -- The queue may have completed (or dropped, see process_queue's on_drop) just before
     -- this stop arrived - read the persisted total instead of hard-coding zero.

@@ -183,14 +183,17 @@ commands.add_command("fac_companion_stop_all", nil, function(cmd)
       queues.stop_build(id)
       stopped[#stopped + 1] = "build"
     end
-    if storage.combat_queues and storage.combat_queues[id] then
-      -- Delegate rather than dropping the table directly: stop_combat also persists the round's
-      -- kills into storage.combat_results (same reasoning as the build queue above) AND clears
-      -- shooting_state - a stop_all used to leave shooting_enemies latched with the queue gone,
-      -- so nothing left in the mod would ever un-stick a companion stopped mid-fight.
-      queues.stop_combat(id)
-      stopped[#stopped + 1] = "combat"
-    end
+    -- UNCONDITIONAL, unlike every other queue above: fac_action_attack (action.lua) sets
+    -- shooting_state directly and creates no combat_queues entry, so gating this call on the
+    -- queue existing made stop_combat's own unconditional clear unreachable for the only
+    -- caller that needed it - a companion set firing by fac_action_attack stayed latched.
+    -- stop_combat is a no-op on the queue-less path apart from that clear, so calling it
+    -- always is safe; `stopped` still reports only a queue that genuinely existed.
+    local had_combat = storage.combat_queues and storage.combat_queues[id] ~= nil
+    -- Delegate rather than dropping the table directly: stop_combat also persists the round's
+    -- kills into storage.combat_results (same reasoning as the build queue above).
+    queues.stop_combat(id)
+    if had_combat then stopped[#stopped + 1] = "combat" end
     if storage.walking_queues and storage.walking_queues[id] then
       storage.walking_queues[id] = nil
       stopped[#stopped + 1] = "walk"
