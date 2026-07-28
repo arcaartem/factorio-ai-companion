@@ -1,4 +1,14 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.20.1
+Date: 2026-07-28
+  Bugfixes:
+    - 0.20.0 could not be loaded at all. Removing the wololo sound left data.lua calling
+      data:extend({}) with an empty array, which dataloader.lua:23 rejects with "Invalid array
+      of prototypes", failing the whole mod load. data.lua now defines nothing and makes no
+      extend call. Found by a headless server refusing to start; the data stage runs only at
+      application startup, so no control-stage smoke suite could have caught it.
+
+---------------------------------------------------------------------------------------------------
 Version: 0.20.0
 Date: 2026-07-28
   Changes:

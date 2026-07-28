@@ -1,2 +1,9 @@
--- AI Companion v0.9.0 - Data definitions
-data:extend({})
+-- AI Companion - Data stage.
+--
+-- Intentionally defines no prototypes. The mod's only data-stage entry was the
+-- ai-companion-wololo sound, removed in 0.20.0 along with the command it played for.
+--
+-- Do NOT "restore" a `data:extend({})` call here: dataloader.lua:23 raises
+-- "Invalid array of prototypes: {}" on an empty array, which fails the whole mod load at
+-- application startup. That is how 0.20.0 shipped broken - the data stage runs only when
+-- Factorio starts, so every control-stage smoke suite passed while the mod could not load.

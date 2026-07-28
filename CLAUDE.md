@@ -109,6 +109,16 @@ while `queues.lua`/`init.lua`/`companion.lua` predated the fixes they were suppo
 ## Gotchas
 
 - **Reloading mod code:** control-stage files (`control.lua` + everything it requires) are re-read from disk on every save load — main menu → Host Saved Game is enough, no app restart. Only `data.lua` needs a full restart. A `version` bump in `info.json` does NOT help: the running app only re-reads it at startup, so `on_configuration_changed` never fires on a re-host. Any new `storage.*` field must therefore be nil-guarded at its use sites (`storage.x = storage.x or {}`), not just declared in `init_storage()`.
+- **A green smoke run says NOTHING about whether the mod can load — the harness is structurally
+  blind to the data stage.** Every suite here drives control-stage commands, which can only run once
+  the mod has already loaded, so a mod that fails at load produces no red assertions; it produces no
+  run at all. Mod 0.20.0 shipped exactly that way: removing the wololo sound left `data.lua` calling
+  `data:extend({})`, and `__core__/lualib/dataloader.lua:23` rejects an empty array with
+  `Invalid array of prototypes`, failing the whole mod. **A data-stage file with nothing to declare
+  must make no `extend` call at all** — an empty table is not a no-op. The failure surfaces only in
+  the server log (`Failed to load mod "ai-companion"`) and only at *application* startup, so the
+  cheapest gate is that `test-server.ts` reaches RCON-ready at all; if it never binds, read
+  `.fac-test-server/server.log` before suspecting anything else.
 - **`/silent-command` runs in the level script context**, which has its own `storage` separate from the mod's — it cannot read or write `storage.companions`, `storage.companion_messages`, etc. `game`, surfaces and entities are reachable. Anything touching mod state must go through a `/fac_*` command.
 - **Tool arguments are NOT byte-verbatim through MCP — `buildRCONCommand` normalises whitespace.** `src/mcp/tools.ts` collapses every `\s+` run to a single space and trims, across the *whole* rendered command including argument values, so `chat_say("a  b")` arrives in game as `a b` and `"  x  "` as `x`. It exists to tidy slots that substituted to `""`, but it cannot tell a padding space from a payload one. Values are otherwise safe, for a reason worth knowing: the replacer is a **function**, and `String.replace` only interprets `$&`/`$$`/`` $` ``/`$1` when the replacement is a *string* — so `$` needs no escaping — and `/g` never re-scans inserted text, so a literal `{radius}` inside a value cannot be re-substituted. Both are pinned by `src/mcp/tools.test.ts`. Send over raw RCON when you need a payload preserved exactly; multi-space survives the Lua and transport halves untouched (verified live, `t013` A3/A4).
 - **`fac_chat_say` leaves no record — the `said` echo is the only observable.** It just calls `game.print`; nothing lands in mod storage, `fac_chat_get` drains the *inbound* queue so it can never see an outbound say, `storage.errors` is write-only, and the interactive game's `factorio-current.log` carries no `game.print` output at all. Assert on the handler's returned `{id, name, said}`.
