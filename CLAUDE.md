@@ -121,6 +121,37 @@ while `queues.lua`/`init.lua`/`companion.lua` predated the fixes they were suppo
 - **`mining_state.mining` never goes false while the ore tile still has ore**, so any "mining stopped → count it" guard is dead code. A resource entity decrements `amount` (hundreds of ore per tile) rather than being consumed per ore; probed true in 20/20 samples over 10s while 5 ore were produced. This is what pinned `harvested` at 0 for four releases. Count a real main-inventory delta **every tick**, resetting the snapshot each time (or you double-count); advance to the next tile on `q.current.entity.valid` going false, not on `mining_state`. There is no `on_player_mined_entity` handler and adding one would not help — a controllerless character raises no player-mined events.
 - **A finished queue's outcome must be recorded before the queue is deleted.** `resource_mine_status` returns `{active=false, harvested, target, reason}` from `storage.harvest_results` (reasons: `target_reached` / `too_far` / `pool_empty` / `stalled` / `stopped`), because the queue vanishes on the same tick its final ore is counted — a terminal poll otherwise has no way to read the result at all. Same shape as `storage.combat_results`. Before this, `mine-until`'s *success* path returned 0 even with counting fixed.
 - **`find_entities_filtered`'s `limit` truncates in chunk order, with no distance ordering** — so "scan wide with a limit, then pick the minimum" returns *nearest of an arbitrary sample*. This was `resource_nearest`/`world_nearest` until 0.17.0 (±200 square, `limit = 100`): probed live, it was wrong for **all four** ore types at one position, worst case naming a patch at 106.95 while ore sat at 98.39 on the opposite side of the map. The fix idiom is `u.find_nearest` (`init.lua`) — an **unlimited** circular search grown 8→16→32→64→128→200, complete by construction because everything omitted is farther than the ring's own radius, and cheap because the near case stops at ring 1. Reach for that helper rather than adding another limited scan. `fac_resource_list` still has the same shape (`limit = 20` then sort) and is untouched — it's on T-015.
+- **Fluid connections mate on BOTH halves, from the right fluidbox — and the offsets are already
+  in the prototype.** Two fluidboxes connect when A's connection *position* equals B's *target*
+  **and** B's position equals A's target; checking only the target half accepts two connections
+  aimed *past* each other, which look like a match and never move fluid. The matching connection
+  must also come from the intended box — a boiler has box 1 water (`production_type = "input"`,
+  `flow_direction = "input-output"`) and box 2 steam (`"output"`), and a boiler whose *steam*
+  output mates the pump is geometrically valid, physically backwards, and sits at `no_fuel`
+  forever. Don't search for a placement: `prototypes.entity[n].fluidbox_prototypes[i]
+  .pipe_connections[k].positions` is an array of **one offset per direction** (1=N, 2=E, 3=S,
+  4=W), so the placement is computable. Dumping only `positions[1]` — the obvious thing — hides
+  the direction relationship entirely and makes the offsets look constant. Parity matters too: an
+  entity of ODD tile extent centres on a tile centre (`x.5`), EVEN on a tile boundary (integer),
+  and the parities swap for E/W facings, so a wrong-parity candidate grid produces silently
+  illegal placements that read as "no position works". Working chain (T-001): pump `(9.5,33.5)`
+  facing S → output `(9.5,32.5)`; boiler `(10,31.5)` facing E, water conn offset `(-0.5,+1)`;
+  engine `(13.5,31.5)` facing E, input conn offset `(-2,0)`.
+- **`can_place_entity` is not a validity oracle for the offshore pump** — it returned `true` on a
+  dry `sand-2` tile with **no water within 6 tiles**, in all four directions. Derive shoreline from
+  `get_tile` adjacency instead. The pump's output is one tile in its facing direction and
+  `direction` fully controls it, so a shore whose output tile is water just needs the pump turned;
+  `building_place`'s direction argument is the lever, and passing `0` to every call (as the T-001
+  probes initially did) makes the output look fixed.
+- **Three commands report an outcome that doesn't match reality** (open cards, so don't trust their
+  replies as evidence): `building_rotate` returns `{rotated, direction}` while the entity never
+  turns (T-039); `building_empty` returned `{error="count must be positive"}` while extracting all
+  45 plates, suspected negative-coordinate arg mis-binding (T-040); and `building_remove` resolves
+  at the *requested* coordinates while Factorio snaps entities elsewhere, so a place/inspect/remove
+  search loop silently strands buildings and drains the companion's inventory until further
+  placements fail `{"error":"Not in inventory"}` — which presents as "no valid position exists"
+  (T-041). Remove at the entity's **actual** position from the inspect step, and sweep for strays
+  before reporting a result.
 - **Wood is selected by TYPE, not name (mod 0.18.0).** Trees ship dozens of prototypes (`tree-01`
   … `dead-dry-hairy-tree`), so `{name = "wood"}` matches nothing — asking for wood before 0.18.0
   returned `{error = "No resource"}` because `fac_resource_mine` and `queues.start_harvest` both
