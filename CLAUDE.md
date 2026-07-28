@@ -74,7 +74,7 @@ bun run scripts/smoke/test-server.ts t034      # deploy, fresh server, run suite
 ```
 See "Preferred loop" below for what it does and its one limitation.
 
-**Manual path** (needed only for the combat suites, which require a connected client; macOS — this machine, the upstream README's `/c/Users/lveil/...` Windows path does not exist here):
+**Manual path** (only needed for interactive poking at a live game — `test-server.ts --client` now automates the combat suites too, see Gotchas; macOS — this machine, the upstream README's `/c/Users/lveil/...` Windows path does not exist here):
 ```bash
 MODS=~/Library/Application\ Support/factorio/mods/ai-companion
 cp -r factorio-mod/* "$MODS/"
@@ -89,16 +89,22 @@ behaviourally, not from the reply). `/fac_version` reads `script.active_mods`, p
 *application* startup — it reported `0.13.7` while 0.16.0 code ran. The only trustworthy evidence is
 `diff -rq` plus a behavioural probe of something the new code changes.
 
-**Preferred loop — don't re-host at all: `bun run scripts/smoke/test-server.ts <suite>`.** It
-deploys `factorio-mod/` (with the `diff -rq` gate), copies your newest save, starts a *disposable
+**Preferred loop — don't re-host at all: `bun run scripts/smoke/test-server.ts <suite>`, or
+`--client <suite>` when the suite needs a live combat client.** The base form deploys
+`factorio-mod/` (with the `diff -rq` gate), copies your newest save, starts a *disposable
 headless server* on its own ports and its own `write-data` dir, runs the suite against it, and tears
 everything down. A fresh process always reads the mod off disk, so this **is** the reload — and it
 runs alongside the game you're playing without touching it, so the suites stop teleporting
-companions and planting ore in your real world. Two things to know: a second Factorio process needs
-its own `write-data` (the first holds an exclusive lock on the user dir) and its own `--port`, both
-of which the script handles; and with no client connected `game.players[1]` is valid but has **no
-character**, so companions spawn *unarmed* — mining/movement/world suites are fine, the combat
-suites (t021, t026) still need your interactive game. Use `--serve`/`--keep` to hold the server up,
+companions and planting ore in your real world. It operates on a **copy** of your save, never the
+original — this is why the loop can never serve work that must persist into the world you actually
+play. With no client connected `game.players[1]` is valid but has **no character**, so companions
+spawn *unarmed*: mining/movement/world suites are fine with that, the combat suites are not.
+`--client` (mod 0.21.1 harness) closes that gap — it launches a real Factorio client attached to the
+disposable server via `--mp-connect` and waits for `game.players[1]` to have a character before
+running the suite, so the combat suites (t021, t026, t051) now automate too; see the Steam-build
+trap in Gotchas before using it. Three Factorio roots are in play now, each needing its own
+`write-data` and `--port`: the game you're playing, the disposable server, and — with `--client` —
+the attached client; the script handles all three. Use `--serve`/`--keep` to hold the server up,
 `--save <path>` to pin a world.
 
 **Always run that `diff` before any live test.** The deployed dir is the only code Factorio
@@ -148,21 +154,58 @@ while `queues.lua`/`init.lua`/`companion.lua` predated the fixes they were suppo
   "nothing here" distinction the field exists to provide. The search is now capped at a plain 50
   and the per-item `check_reach` is the only gate on picking. Same shape as the query exemption
   above: looking is not acting.
-- **`stop_combat` clears `shooting_state` BEFORE its `if not q then return` early exit, and that
-  ordering is load-bearing.** `fac_action_attack` sets `shooting_state` directly and creates no
-  combat queue at all, so nothing in the mod could stop a companion it had set firing —
-  `stop_combat` returned early on the missing queue and `stop_all` cleared only
-  `walking_state`/`mining_state`. `fac_companion_stop_all` now delegates to
-  `queues.stop_combat`/`stop_build` instead of dropping the queue tables inline, which also
-  restores the `build_results` write a stop used to skip (so a `building_place_status` poll after
-  a stop no longer reads the PREVIOUS run's outcome). Moving that clear back inside the queue
-  branch would re-break the queue-less path — and no headless suite can catch it, see below.
-- **The combat paths are structurally unverifiable headless.** With no client connected
-  `game.players[1]` has no character, so companions spawn UNARMED and 0.21.0's weapon/ammo gate
-  short-circuits `fac_action_attack`, `start_combat`, the chase leash and `stop_all`'s shooting
-  clear before any of them do anything. A green `test-server.ts` run says nothing about them.
-  Arming the companion over the side channel to get around this proves the harness, not the mod —
-  use the interactive game, as `t021`/`t026` already do.
+- **`stop_combat` clearing `shooting_state` BEFORE its `if not q then return` early exit was
+  necessary but not sufficient (mod 0.21.0 → 0.21.1).** `fac_action_attack` sets `shooting_state`
+  directly and creates no combat queue at all, so nothing in the mod could stop a companion it had
+  set firing unless `stop_combat`'s own early return let the clear through first — 0.21.0 got that
+  ordering right. But the *caller*, `fac_companion_stop_all`, still gated the call itself on
+  `storage.combat_queues[id]`, a table `fac_action_attack` never populates — so the one caller that
+  needed the fix could never reach it. The ordering was correct and unreachable; the bug had moved
+  from the callee to the caller without changing symptom, and the previous version of this note
+  warned against moving the clear back inside the queue branch without noticing that `stop_all`'s
+  gate had, in effect, already done exactly that by never calling `stop_combat` for the queue-less
+  path in the first place. 0.21.1 calls `queues.stop_combat` unconditionally from `stop_all` instead
+  of gating it, and nil-guards `storage.combat_queues` inside `stop_combat` itself, since the
+  removed gate had been providing that guard as an incidental side effect, not by design. The
+  `stopped` list in the response still names `"combat"` only when a queue genuinely existed, so the
+  response contract is unchanged. General lesson: a fix's correct internal ordering plus an
+  accurate comment describing it is not evidence the intended caller actually reaches that code —
+  check the call site, not just the callee.
+- **`fac_action_attack` and the combat QUEUE are disjoint state.** `fac_action_attack` (`action.lua`)
+  sets `shooting_state` directly, creates no `storage.combat_queues` entry, credits no kills, and
+  writes nothing to `storage.combat_results` — so `fac_action_attack_status` can never reflect a
+  synchronous `action_attack`; a poll after one reads the previous queued round's result, or zero.
+  Also worth knowing: `fac_action_attack` has a deliberate **ground-fire fallback** — when nothing
+  hostile resolves within radius 2 of the aim point it does not error, it returns
+  `{attacking:true, target:"ground"}` and fires at the point. A test expecting a refusal there is
+  wrong, not the mod: `u.resolve_target` returns `nil` plus an error table without emitting a
+  response, which is what makes the fallback clean.
+- **The combat paths were unverifiable headless — `--client` (harness change, not a mod change)
+  fixes that.** Without a connected client `game.players[1]` has no character, so companions spawn
+  UNARMED and 0.21.0's weapon/ammo gate short-circuits `fac_action_attack`, `start_combat`, the
+  chase leash and `stop_all`'s shooting clear before any of them do anything — a green plain
+  `test-server.ts` run said nothing about them. `test-server.ts --client` now attaches a real
+  Factorio client via `--mp-connect` and waits for a character before running the suite, and `t051`
+  ran all of this 59/59 across three consecutive runs. Arming the companion over the side channel
+  to dodge the missing-character problem would still prove the harness, not the mod — that's why
+  the fix is a real client rather than a shortcut; see Setup and the Steam-build trap below for
+  what `--client` actually requires.
+- **The client (`--client`) is a Steam binary, and Steam's own restart-guard blocks a bare
+  `--mp-connect` launch.** Launched directly, it calls `SteamAPI_Init()`; with no `steam_appid.txt`
+  in its cwd telling it its app id, it concludes it wasn't launched through Steam, calls
+  `SteamAPI_RestartAppIfNecessary()`, and exits with "Steam requires game restart, restarting..."
+  instead of connecting — Steam itself must already be running and logged in. A `steam_appid.txt`
+  in the client's working directory skips the check. The headless `--start-server` path never
+  initialises the Steam API at all, which is why this trap had never surfaced before `--client`
+  existed. Separately, the client reuses the real `player-data.json`, so it authenticates as the
+  same account the save already knows as `game.players[1]` — a fresh `write-data` has none and
+  would join anonymously as a NEW player, leaving `players[1]` characterless while everything else
+  appeared to work; that index matters because `fac_companion_spawn` arms specifically from
+  `game.players[1]`. That file holds an auth token and must never be logged. And
+  `~/Applications/factorio.app` is a Steam launcher STUB whose `run.sh` is a single
+  `open steam://run/427520` — the real binary lives under the Steam library (this machine:
+  `/Volumes/External Storage/MacosSteamLibrary/...`), which `findFactorioBinary()` already sweeps
+  `/Volumes/*` for.
 - **A capability that cannot be bounded to player parity is REMOVED, not reach-limited (mod
   0.20.0).** `action_wololo` converted an enemy — including a nest, permanently and for free — at
   radius 25. There is no player action that converts an enemy at *any* distance, so no radius makes
@@ -303,4 +346,4 @@ while `queues.lua`/`init.lua`/`companion.lua` predated the fixes they were suppo
 - Validation: `bun run scripts/validate-tools.ts` (**51 tools = 51 Lua commands as of mod 0.20.0**, which removed `action_wololo`; 0.15.0 removed `companion_realistic`; also checks arity/argument order, not just names). CAVEAT: it covers the request side only — Lua *response shapes* and the hand-rolled command strings inside `src/skills/*.ts` are unchecked, and both have drifted before. Contract changes need a live in-game check, not just a green validator. **`checkArity` now also flags an optional Lua capture that NO tool exposes (added 0.21.0)** — it used to assert only that the TS placeholder count fell within `[mandatory..total]`, so `fac_companion_inventory` declaring 1 of its 3 captures passed cleanly while its chest-inspection branch stayed unreachable through MCP. That check lit up 4 tools / 5 captures, all now exposed (`companion_inventory` x/y, `companion_health` target, `item_recipes` filter, `research_progress` technology), and it is a hard error — so adding a Lua capture without a TS param fails the pre-commit gate. The mirror-image defect is still invisible: `validate-tools.ts` skips the 17 commands with no `parse_args` at all, which is how `TOOLS.help` gets away with templating a `{category}` that `help.lua` never accepts.
 - Lua has no test harness here, but `luac -p factorio-mod/commands/*.lua` (mise-provided) is a free syntax gate — neither the validator nor `bun test` parses Lua at all.
 - Lefthook runs validation + `bun test` on pre-commit
-- Live smoke tests: `scripts/smoke/` — drives the real MCP server over stdio (`bun run src/index.ts`) with a second RCON connection as a side channel, one script per fix (`bun run scripts/smoke/t019-building-item-loss.ts`, …). **The combat suites construct a controlled arena rather than searching the live map**: they find a spot 80-160 tiles out verified clear of spawners and worms (worms are prototype `type="turret"`), teleport the companion in, and `create_entity` exactly the enemies needed, tracked by `unit_number` for exact teardown. **`unit_number` is nil on resource entities** (and simple entities generally), so an ore arena must key teardown on the exact recorded position instead — tracking ore by id silently no-ops and leaves every planted tile in the live world (bit `t031` for 4 runs; verify world cleanliness independently, since a no-op teardown logs nothing). Spawning items and teleporting is sanctioned **in harnesses only** — the mod's gameplay behaviour stays within player parity. Deliberately NOT named `*.test.ts`: lefthook runs `bun test` on pre-commit and these need a live hosted game. Note `src/mcp/server.ts` only exports the class — the entry point is `src/index.ts`, and it must be spawned with the repo root as cwd so relative skill paths, `.fac-skills/` and `.env` resolve. **The MCP SDK does not pass the parent environment to the server it spawns** — it substitutes a sanitized default — so `lib.ts`'s `connectMCP` merges `process.env` in explicitly. Without that merge a suite's MCP half falls back to the repo `.env` while its side-channel RCON honours the caller's `FACTORIO_*` overrides, and the two halves silently drive **different Factorio instances**; it presents as a code failure (t034's banner reported stale mod code that a direct RCON probe had just shown fresh). Prefer `test-server.ts` (see Setup) over running a suite by hand — it sets that env correctly and gives you a fresh mod load for free. **Assume a red run is the harness until you have ruled it out** — every suite here has produced at least one failure that was the test, not the code (t013's only red assertion matched Lua's error text in the wrong word order: the real phrasing puts `(a nil value)` *after* the variable name, as `attempt to index local 'player' (a nil value)`). Two spill-related traps for new suites: `u.spill_equipment` spills with `enable_looted = true`, so any character within `loot_pickup_distance` 2 — including a freshly respawned companion in a later section — silently vacuums the items back up and inflates a nearby harvest counter; and spilled stacks split across several `item-entity` entities, so compare **summed counts per name**, never entity counts.
+- Live smoke tests: `scripts/smoke/` — drives the real MCP server over stdio (`bun run src/index.ts`) with a second RCON connection as a side channel, one script per fix (`bun run scripts/smoke/t019-building-item-loss.ts`, …). **The combat suites construct a controlled arena rather than searching the live map**: they find a spot 80-160 tiles out verified clear of spawners and worms (worms are prototype `type="turret"`), teleport the companion in, and `create_entity` exactly the enemies needed, tracked by `unit_number` for exact teardown. **`unit_number` is nil on resource entities** (and simple entities generally), so an ore arena must key teardown on the exact recorded position instead — tracking ore by id silently no-ops and leaves every planted tile in the live world (bit `t031` for 4 runs; verify world cleanliness independently, since a no-op teardown logs nothing). Spawning items and teleporting is sanctioned **in harnesses only** — the mod's gameplay behaviour stays within player parity. Deliberately NOT named `*.test.ts`: lefthook runs `bun test` on pre-commit and these need a live hosted game. Note `src/mcp/server.ts` only exports the class — the entry point is `src/index.ts`, and it must be spawned with the repo root as cwd so relative skill paths, `.fac-skills/` and `.env` resolve. **The MCP SDK does not pass the parent environment to the server it spawns** — it substitutes a sanitized default — so `lib.ts`'s `connectMCP` merges `process.env` in explicitly. Without that merge a suite's MCP half falls back to the repo `.env` while its side-channel RCON honours the caller's `FACTORIO_*` overrides, and the two halves silently drive **different Factorio instances**; it presents as a code failure (t034's banner reported stale mod code that a direct RCON probe had just shown fresh). Prefer `test-server.ts` (see Setup) over running a suite by hand — it sets that env correctly and gives you a fresh mod load for free. **Assume a red run is the harness until you have ruled it out** — every suite here has produced at least one failure that was the test, not the code (t013's only red assertion matched Lua's error text in the wrong word order: the real phrasing puts `(a nil value)` *after* the variable name, as `attempt to index local 'player' (a nil value)`). Two spill-related traps for new suites: `u.spill_equipment` spills with `enable_looted = true`, so any character within `loot_pickup_distance` 2 — including a freshly respawned companion in a later section — silently vacuums the items back up and inflates a nearby harvest counter; and spilled stacks split across several `item-entity` entities, so compare **summed counts per name**, never entity counts. `scripts/smoke/t051-combat-parity.ts` is the newest of these — the combat-parity suite, driven via `test-server.ts --client`, 59/59 across three consecutive runs. Its first live run put a new shape on "assume a red run is the harness until you have ruled it out": the 4 reds were the harness, but not a broken assertion — section 5's leash test walks the companion ~30 tiles by design, and sections 6/7 had anchored on a stale arena constant, so a section that PASSED had invalidated a LATER section's preconditions, rather than a setup bug shadowing a real defect.
