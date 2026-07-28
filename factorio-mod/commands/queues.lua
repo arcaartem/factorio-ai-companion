@@ -61,6 +61,9 @@ function M.init()
   -- Outcome of the last finished combat round per companion. The queue is deleted on the
   -- same tick the final kill is counted, so this is the only way a terminal poll can see it.
   storage.combat_results = storage.combat_results or {}
+  -- Outcome of the last finished async build per companion, for the same reason: the build
+  -- queue is deleted the same tick create_entity's result is known.
+  storage.build_results = storage.build_results or {}
 end
 
 -- ============ WALK ============
@@ -604,6 +607,26 @@ end
 
 -- ============ BUILD ============
 
+-- Terminates a build queue and records its outcome so a poll arriving AFTER the queue is
+-- gone (M.get_build_status finding storage.build_queues[cid] == nil) can still read where
+-- the entity actually landed - the queue itself is deleted by the caller (process_queue's
+-- to_remove, or M.stop_build directly), not here.
+local function finish_build(cid, q, c, placed_entity, reason)
+  storage.build_results = storage.build_results or {}
+  -- create_entity can snap to a different tile than requested - report the real position
+  -- when something was actually placed, the request otherwise (nothing to report instead).
+  local position = placed_entity and {x = placed_entity.position.x, y = placed_entity.position.y} or q.position
+  storage.build_results[cid] = {
+    placed = placed_entity ~= nil,
+    entity = q.entity,
+    position = position,
+    requested = {x = q.position.x, y = q.position.y},
+    reason = reason,
+    tick = game.tick
+  }
+  return true
+end
+
 function M.start_build(cid, entity_name, position, direction)
   local c = valid_companion(cid)
   if not c then return {error = "Invalid companion"} end
@@ -628,6 +651,10 @@ function M.start_build(cid, entity_name, position, direction)
     direction = dir,
     tick_start = game.tick
   }
+  -- Drop any stale result from a previous run - a poll on this new run must never be able to
+  -- read a leftover outcome that belongs to the last one.
+  storage.build_results = storage.build_results or {}
+  storage.build_results[cid] = nil
 
   return {started = true, entity = entity_name, position = position}
 end
@@ -642,24 +669,51 @@ function M.tick_build_queues()
       direction = q.direction,
       force = c.entity.force
     }
-    if placed then c.entity.remove_item{name = q.entity, count = 1} end
-    return true
+    if placed then
+      c.entity.remove_item{name = q.entity, count = 1}
+      return finish_build(cid, q, c, placed, "placed")
+    end
+    return finish_build(cid, q, c, nil, "blocked")
+  end, function(cid, q)
+    -- Companion died/vanished mid-build: persist an outcome before process_queue drops the
+    -- queue, else a terminal poll could never learn the build never happened.
+    storage.build_results = storage.build_results or {}
+    storage.build_results[cid] = {
+      placed = false,
+      entity = q.entity,
+      position = {x = q.position.x, y = q.position.y},
+      requested = {x = q.position.x, y = q.position.y},
+      reason = "stopped",
+      tick = game.tick
+    }
   end)
 end
 
 function M.get_build_status(cid)
   local q = storage.build_queues[cid]
-  if not q then return {active = false} end
+  if not q then
+    -- The queue is gone (self-terminated or stopped) - the only way a poll arriving after
+    -- that can still see the outcome is what finish_build recorded.
+    local last = (storage.build_results or {})[cid]
+    if last then
+      return {active = false, placed = last.placed, entity = last.entity, position = last.position, requested = last.requested, reason = last.reason}
+    end
+    return {active = false}
+  end
   return {
     active = true,
     entity = q.entity,
     position = q.position,
+    requested = {x = q.position.x, y = q.position.y},
     progress = math.floor((game.tick - q.tick_start) / BUILD_TICKS * 100)
   }
 end
 
 function M.stop_build(cid)
-  if not storage.build_queues[cid] then return {stopped = false} end
+  local q = storage.build_queues[cid]
+  if not q then return {stopped = false} end
+  local c = valid_companion(cid)
+  if c then finish_build(cid, q, c, nil, "stopped") end
   storage.build_queues[cid] = nil
   return {stopped = true}
 end

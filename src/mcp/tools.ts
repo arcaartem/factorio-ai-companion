@@ -237,12 +237,13 @@ export const TOOLS: Record<string, {
   },
   building_can_place: {
     desc: "Check if entity can be placed at coordinates",
-    rcon: "/fac_building_can_place {companionId} {entityName} {x} {y}",
+    rcon: "/fac_building_can_place {companionId} {entityName} {x} {y} {direction}",
     params: {
       companionId: { type: "number", required: true },
       entityName: { type: "string", required: true },
       x: { type: "number", required: true },
-      y: { type: "number", required: true }
+      y: { type: "number", required: true },
+      direction: { type: "number", desc: "Direction 0-3", default: 0 }
     }
   },
   building_info: {
@@ -257,12 +258,13 @@ export const TOOLS: Record<string, {
   },
   building_rotate: {
     desc: "Rotate a building at coordinates",
-    rcon: "/fac_building_rotate {companionId} {x} {y} {direction}",
+    rcon: "/fac_building_rotate {companionId} {x} {y} {direction} {entityName}",
     params: {
       companionId: { type: "number", required: true },
       x: { type: "number", required: true },
       y: { type: "number", required: true },
-      direction: { type: "number", desc: "Direction 0-3 (N/E/S/W)", required: true }
+      direction: { type: "number", desc: "Direction 0-3 (N/E/S/W)", required: true },
+      entityName: { type: "string", desc: "Optional: restrict to this entity name", required: false, default: "" }
     }
   },
   building_recipe: {
@@ -288,24 +290,26 @@ export const TOOLS: Record<string, {
   },
   building_empty: {
     desc: "Empty contents from entity",
-    rcon: "/fac_building_empty {companionId} {itemName} {count} {x} {y}",
+    rcon: "/fac_building_empty {companionId} {itemName} {count} {x} {y} {entityName}",
     params: {
       companionId: { type: "number", required: true },
       itemName: { type: "string", required: true },
       count: { type: "number", desc: "Amount to extract", required: false, default: 10 },
       x: { type: "number", required: false },
-      y: { type: "number", required: false }
+      y: { type: "number", required: false },
+      entityName: { type: "string", desc: "Optional: restrict to this entity name", required: false, default: "" }
     }
   },
   building_fill: {
     desc: "Fill entity with items",
-    rcon: "/fac_building_fill {companionId} {itemName} {count} {x} {y}",
+    rcon: "/fac_building_fill {companionId} {itemName} {count} {x} {y} {entityName}",
     params: {
       companionId: { type: "number", required: true },
       x: { type: "number", required: true },
       y: { type: "number", required: true },
       itemName: { type: "string", required: true },
-      count: { type: "number", required: true }
+      count: { type: "number", required: true },
+      entityName: { type: "string", desc: "Optional: restrict to this entity name", required: false, default: "" }
     }
   },
 

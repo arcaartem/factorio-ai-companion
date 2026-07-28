@@ -1,4 +1,60 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.19.0
+Date: 2026-07-28
+  Bugfixes:
+    - building_empty extracting items always errored with "count must be positive" even though
+      the extraction itself had already succeeded. defines.inventory.{chest, furnace_result,
+      assembling_machine_output} are {1, 3, 3} - index 3 aliased twice - so once the request was
+      satisfied at index 3 the inner loop visited it again with want=0 and insert{count=0} raised
+      after the items had already moved. The inventory index list is now de-duplicated and the
+      inner loop breaks before a zero-count insert; count<=0 is now also rejected up front as a
+      clean error instead of falling through `tonumber(args[3]) or 10` (0 is truthy in Lua)
+    - building_rotate reported {rotated = true} even when the entity never turned. It now reads
+      the direction back off the entity after assigning and reports failure ({error = "Rotate had
+      no effect"}) when the read-back doesn't match what was requested; an out-of-range direction
+      index (anything but 0-3) is now rejected instead of silently becoming north
+      (u.dir_map[7] == nil)
+    - building_remove resolved its target by requested coordinates, not the entity's actual
+      position - since create_entity can snap elsewhere, a place/inspect/remove loop could strand
+      buildings and drain the companion's inventory retrying at a dead coordinate. Every building
+      command below now goes through the new u.resolve_target helper, which picks the nearest
+      surviving match by distance (find_entities_filtered's order is engine chunk order, not
+      distance order - the old `es[1]` pick was arbitrary) and checks reach against the resolved
+      entity's position rather than the requested point
+    - fuel/fill/empty checked reach against the requested x/y instead of the entity they ended up
+      acting on, so a companion could be told "too far" for an entity that was actually in range,
+      or vice versa. Fixed via the same resolve_target path
+    - building_fill had the same zero-count defect as building_empty: 0 survives
+      `tonumber(args[3]) or 10` (truthy in Lua) and reaches insert{count = math.min(0, have)},
+      which raises "count must be positive". It now rejects count<=0 up front like empty does
+    - building_fuel's filter listed `"burner-inserter"` as a prototype TYPE, but a burner
+      inserter's actual type is `"inserter"` - the entry never matched anything, so burner
+      inserters were unfuellable. Fixed by filtering on `"inserter"` (the fuel-inventory predicate
+      still excludes electric inserters)
+  Changes:
+    - fill and empty now resolve and act on a single nearest entity instead of fanning out across
+      every match in radius until the count is satisfied - the old fan-out could split one
+      `inserted`/`extracted` count across several entities, and empty's unrestricted radius-5
+      search could drain the connected player's own inventory (defines.inventory.chest ==
+      character_main == 1, so a character is a valid "chest"). Both now take an optional trailing
+      entityName argument to narrow the match, and exclude character entities by default
+    - building_fill previously had no force filter at all and is now restricted to the companion's
+      own force. That closes filling an enemy's containers, but also narrows it: neutral
+      containers (crash-site wreckage) can no longer be filled, though empty still reads them.
+      Deliberate asymmetry - loot unowned wreckage, but only stock your own buildings
+    - building_place, building_fuel, building_fill, building_empty, building_rotate and
+      building_recipe success payloads now include the resolved entity's actual `position` (and
+      `entity` name where it wasn't already reported), so a caller can act on where something
+      really is rather than where it was requested
+    - building_can_place's RCON template gained the `direction` argument its Lua handler already
+      accepted, so it now answers for the direction actually being placed instead of always north
+    - building_place_status can now report a finished placement. The build queue entry is pruned
+      on the same tick the entity is created, so a poll arriving afterwards had no way to read the
+      outcome at all; the result is now recorded in storage.build_results before the entry is
+      deleted (same idiom as harvest/combat) and reports placed, entity, the entity's real
+      position, the originally requested position, and a reason of placed/blocked/stopped
+
+---------------------------------------------------------------------------------------------------
 Version: 0.18.0
 Date: 2026-07-27
   Features:

@@ -1,4 +1,4 @@
--- AI Companion v0.9.0
+-- AI Companion v0.19.0
 local M = {}
 
 M.COLORS = {
@@ -159,6 +159,49 @@ function M.find_nearest(surface, pos, filter)
     end
   end
   return nil, nil
+end
+
+-- Resolve the single entity a coordinate-addressed building command should act on.
+-- Returns entity, nil  |  nil, error_table   (caller passes the error table to u.json_response)
+--
+-- Deliberately NOT find_nearest: that grows to a 200-tile radius for "nearest ore anywhere",
+-- the opposite of "the entity at this exact coordinate".
+--
+-- opts: name, type, force (find_entities_filtered filters); radius (default 2); predicate
+-- (function(e) -> boolean, applied after the engine filter); not_found (required error string);
+-- reach (default true, checked against the RESOLVED entity, never the requested point);
+-- reach_kind (passed to check_reach); allow_characters (default false).
+function M.resolve_target(id, c, pos, opts)
+  opts = opts or {}
+  local radius = opts.radius or 2
+  local search = {position = pos, radius = radius}
+  if opts.name then search.name = opts.name end
+  if opts.type then search.type = opts.type end
+  if opts.force then search.force = opts.force end
+  local es = c.entity.surface.find_entities_filtered(search)
+
+  -- find_entities_filtered's order is the engine's own chunk order, not distance order -
+  -- es[1] is an arbitrary member of the match set, not the nearest one.
+  local best, min = nil, math.huge
+  for _, e in ipairs(es) do
+    if e.valid and e ~= c.entity
+       and (opts.allow_characters or e.type ~= "character")
+       and (not opts.predicate or opts.predicate(e)) then
+      local d = M.distance(e.position, pos)
+      if d < min then min, best = d, e end
+    end
+  end
+
+  if not best then
+    return nil, {id = id, error = opts.not_found, searched = {x = pos.x, y = pos.y}, radius = radius}
+  end
+
+  if opts.reach == nil or opts.reach then
+    local err = M.check_reach(id, c, best.position, opts.reach_kind)
+    if err then return nil, err end
+  end
+
+  return best, nil
 end
 
 -- Tile equivalent (water). Returns the tile's position (LuaTile has no stable handle worth
