@@ -2,6 +2,10 @@
 local u = require("commands.init")
 local queues = require("commands.queues")
 
+-- Ceiling on fac_item_pick's ground scan. Bounds the query's cost without pretending to bound
+-- the action - what may actually be picked up is check_reach's business, per item.
+local ITEM_SEARCH_MAX_RADIUS = 50
+
 local function missing_ingredients(inv, recipe, count)
   local missing = {}
   for _, ing in ipairs(recipe.ingredients) do
@@ -59,19 +63,32 @@ commands.add_command("fac_item_pick", nil, function(cmd)
     local id, c = u.find_companion(args[1])
     if not id then u.error_response("Companion not found"); return end
     local filter = args[2] ~= "" and args[2] or nil
-    local radius = tonumber(args[3]) or 5
+    -- Cap the SEARCH at a sane ceiling, not at the reach limit. Reach binds actions, not
+    -- queries: clamping the search to loot_pickup_distance would make skipped_out_of_reach
+    -- structurally dead (nothing past the limit would ever enter the candidate set, so it
+    -- could only ever count the sliver where the engine's bounding-box search overshoots the
+    -- circle), and a caller asking for radius 1000 would learn nothing about the items 5
+    -- tiles away. The per-item check_reach below is the authoritative gate on PICKING.
+    local radius = math.min(tonumber(args[3]) or 5, ITEM_SEARCH_MAX_RADIUS)
     local items = c.entity.surface.find_entities_filtered{type = "item-entity", position = c.entity.position, radius = radius}
-    local picked = {}
+    local picked, skipped = {}, 0
     for _, item in ipairs(items) do
       if item.valid and (not filter or item.stack.name == filter) then
-        local ins = c.entity.insert(item.stack)
-        if ins > 0 then
-          picked[#picked + 1] = {name = item.stack.name, count = ins}
-          if ins >= item.stack.count then item.destroy() else item.stack.count = item.stack.count - ins end
+        -- Picking up is per-item, not all-or-nothing: an item just past reach is skipped so
+        -- the caller can tell "nothing here" from "walk closer", rather than the whole
+        -- command failing because of one out-of-range straggler.
+        if u.check_reach(id, c, item.position, "item") then
+          skipped = skipped + 1
+        else
+          local ins = c.entity.insert(item.stack)
+          if ins > 0 then
+            picked[#picked + 1] = {name = item.stack.name, count = ins}
+            if ins >= item.stack.count then item.destroy() else item.stack.count = item.stack.count - ins end
+          end
         end
       end
     end
-    u.json_response({id = id, picked = picked})
+    u.json_response({id = id, picked = picked, skipped_out_of_reach = skipped})
   end)
 end)
 

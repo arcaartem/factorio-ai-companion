@@ -8,18 +8,45 @@ commands.add_command("fac_action_attack", nil, function(cmd)
     if not id then u.error_response("Companion not found"); return end
     local x, y = tonumber(args[2]), tonumber(args[3])
     if not x or not y then u.error_response("Invalid coordinates"); return end
+    local target_pos = {x = x, y = y}
+
+    -- Bind the AIM POINT, not firing itself - actual damage is separately engine-gated by
+    -- weapon range, same as queues.start_combat. A companion may not designate a target at
+    -- arbitrary map coordinates.
+    local reach_err = u.check_reach(id, c, target_pos)
+    if reach_err then
+      reach_err.attacking = false
+      u.json_response(reach_err)
+      return
+    end
+
+    -- Same weapon/ammo gate as queues.start_combat - report a truthful attacking = false
+    -- instead of latching shooting_state with nothing able to fire.
+    u.arm_from(c.entity, c.entity.get_main_inventory())
+    if not u.equipped_gun(c.entity) then
+      u.json_response({id = id, attacking = false, error = "No weapon equipped"}); return
+    end
+    if u.loaded_ammo_count(c.entity) < 1 then
+      u.json_response({id = id, attacking = false, error = "No ammo"}); return
+    end
 
     -- STOP WALKING - Clear walking queue so attack can take priority
     storage.walking_queues[id] = nil
     c.entity.walking_state = {walking = false}
 
-    local target_pos = {x = x, y = y}
-    local targets = c.entity.surface.find_entities_filtered{position = target_pos, radius = 2, limit = 1}
-    local t = targets[1]
-    if t and t.valid and t ~= c.entity and t.health then
-      c.entity.shooting_state = {state = defines.shooting.shooting_enemies, position = t.position}
-      u.json_response({id = id, attacking = true, target = t.name, position = {x = t.position.x, y = t.position.y}})
+    -- Nearest hostile, not the arbitrary chunk-order es[1] the old find_entities_filtered
+    -- call returned (which admitted trees, rocks and the player's own buildings). reach =
+    -- false: designation range was already bound against target_pos above, not the resolved
+    -- entity's own position.
+    local target = u.resolve_target(id, c, target_pos, {
+      type = {"unit", "unit-spawner"}, force = "enemy", radius = 2,
+      not_found = "No enemy nearby", reach = false
+    })
+    if target then
+      c.entity.shooting_state = {state = defines.shooting.shooting_enemies, position = target.position}
+      u.json_response({id = id, attacking = true, target = target.name, position = {x = target.position.x, y = target.position.y}})
     else
+      -- Deliberate ground-fire fallback when no enemy resolves nearby.
       c.entity.shooting_state = {state = defines.shooting.shooting_enemies, position = target_pos}
       u.json_response({id = id, attacking = true, target = "ground", position = target_pos})
     end

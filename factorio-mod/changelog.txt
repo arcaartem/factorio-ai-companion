@@ -1,4 +1,57 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.21.0
+Date: 2026-07-28
+  Changes:
+    - fac_item_pick is now reach-bound. It was the clearest remaining parity hole: no reach check
+      at all and no radius clamp, so radius=1000 vacuumed ground items off the whole map. The
+      bound is loot_pickup_distance (2), not item_pickup_distance (1) - the engine already
+      vacuums items at 2 passively, so binding at 1 would make the explicit command stricter
+      than doing nothing. Out-of-reach items are skipped rather than failing the call, and the
+      reply carries skipped_out_of_reach so a caller can tell "nothing here" from "walk closer".
+    - fac_action_attack and the attack queue's target point are now reach-bound (reach_distance
+      10). This bounds designation, not firing: actual damage stays engine-gated by weapon range.
+    - fac_resource_list's argument order changed to <id> <radius> <filter>. The old order put an
+      optional, empty-defaulting filter before an always-populated radius, and since the MCP
+      layer collapses whitespace the blank slot vanished and radius's digits bound into filter.
+  Bugfixes:
+    - fac_resource_list returned an empty list on every call that omitted a filter - the most
+      common form. resource_list(id) rendered as "3 50" and Lua bound filter="50", matching no
+      resource; passing radius=120 bound filter="120" and silently reverted radius to 50.
+    - fac_resource_list also truncated with find_entities_filtered's limit=20 and then sorted, so
+      it returned an arbitrary 20 in distance order rather than the 20 nearest, and a filtered
+      call could report count=0 with matches on the map. The filter now goes into the engine
+      query (through u.resource_filter, so "wood" selects trees by type) with no limit.
+    - fac_action_attack reported attacking=true unconditionally with no weapon or ammo check, and
+      picked its target with limit=1 and no type or force filter - so the reported target could
+      name a tree, a rock or one of your own buildings while the companion shot at something
+      else. It now gates on a loaded weapon and resolves the nearest hostile.
+    - shooting_state latched with no way to clear it. fac_action_attack creates no queue, and
+      stop_combat returned early when there was no queue, so nothing in the mod could stop a
+      companion it had set firing. stop_combat now clears shooting_state unconditionally.
+    - fac_companion_stop_all deleted the build and combat queues inline instead of delegating, so
+      a stop left the companion firing and recorded no build result - a building_place_status
+      poll after a stop read the PREVIOUS run's outcome. It now calls stop_build/stop_combat.
+    - The combat chase had no leash and no give-up. It is a raw bearing walk, so a target across
+      water or behind a cliff made the companion press into the obstacle forever. A round now
+      ends at 30 tiles from where it started (reason "leashed") or after 600 ticks without
+      closing on the target (reason "stalled"), recorded before the queue is deleted.
+    - A partial coordinate pair silently acted at the companion's own feet. fac_building_fuel,
+      fac_building_empty and fac_building_fill each tested tonumber(x) and tonumber(y) together,
+      so supplying one coordinate discarded it with no error. One u.optional_position helper now
+      rejects the incomplete pair, and non-numeric coordinates, with a structured error.
+    - fac_companion_inventory's chest branch took the first entity in the engine's chunk order
+      and excluded only the acting companion. Since defines.inventory.chest and character_main
+      are both index 1, a player or second companion standing nearby was reported verbatim as
+      "the chest". It now resolves the nearest non-character entity, and stops listing a
+      container's contents twice (chest and fuel alias to the same index).
+    - fac_building_can_place's out-of-reach reply carried no can_place field, so callers had to
+      parse an error string. It now returns can_place=false alongside the existing error,
+      distance, reach and target fields, and build_smelter_line walks to target and retries.
+    - fac_companion_list never pruned dead companions, so it disagreed with /fac list about what
+      existed.
+    - A companion name containing a space made ~25 commands raise a raw Lua error instead of
+      answering "Companion not found". Quoted names are still unsupported.
+---------------------------------------------------------------------------------------------------
 Version: 0.20.4
 Date: 2026-07-28
   Bugfixes:

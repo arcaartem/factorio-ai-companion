@@ -1,5 +1,6 @@
 -- AI Companion v0.7.0 - Companion commands
 local u = require("commands.init")
+local queues = require("commands.queues")
 
 commands.add_command("fac_companion_list", nil, function(cmd)
   u.safe_command(function()
@@ -13,7 +14,7 @@ commands.add_command("fac_companion_list", nil, function(cmd)
           health = math.floor(c.entity.health / c.entity.max_health * 100),
           name = c.name
         }
-      end
+      else storage.companions[id] = nil end
     end
     table.sort(list, function(a, b) return a.id < b.id end)
     u.json_response({companions = list, count = #list})
@@ -123,14 +124,30 @@ commands.add_command("fac_companion_inventory", nil, function(cmd)
     if not id then u.error_response("Companion not found"); return end
     local x, y = tonumber(args[2]), tonumber(args[3])
     if x and y then
-      local es = c.entity.surface.find_entities_filtered{position = {x=x, y=y}, radius = 2}
-      local t
-      for _, e in ipairs(es) do if e.valid and e ~= c.entity then t = e; break end end
-      if not t then u.json_response({id = id, error = "No entity"}); return end
+      -- read-only inspection: no reach check, deliberately (mirrors building_info). resolve_target
+      -- still picks the NEAREST match and excludes characters by default - without that, and since
+      -- defines.inventory.chest == character_main == 1, a player or companion standing in the
+      -- radius-2 circle used to resolve as "the chest" and report their own main inventory back.
+      local t, err = u.resolve_target(id, c, {x=x, y=y}, {
+        radius = 2, reach = false, not_found = "No entity",
+        predicate = function(e)
+          return e.get_inventory(defines.inventory.chest) ~= nil
+              or e.get_inventory(defines.inventory.furnace_source) ~= nil
+              or e.get_inventory(defines.inventory.furnace_result) ~= nil
+              or e.get_inventory(defines.inventory.fuel) ~= nil
+        end
+      })
+      if not t then u.json_response(err); return end
       local items = {}
+      -- chest and fuel are both index 1 (defines.inventory aliasing) - de-dup, or the second
+      -- visit re-lists the same inventory's contents under a different slot label.
+      local seen = {}
       for _, it in ipairs({{defines.inventory.chest, "chest"}, {defines.inventory.furnace_source, "in"}, {defines.inventory.furnace_result, "out"}, {defines.inventory.fuel, "fuel"}}) do
-        local inv = t.get_inventory(it[1])
-        if inv then for _, item in pairs(inv.get_contents()) do items[#items + 1] = {name = item.name, count = item.count, quality = item.quality, slot = it[2]} end end
+        if not seen[it[1]] then
+          seen[it[1]] = true
+          local inv = t.get_inventory(it[1])
+          if inv then for _, item in pairs(inv.get_contents()) do items[#items + 1] = {name = item.name, count = item.count, quality = item.quality, slot = it[2]} end end
+        end
       end
       u.json_response({id = id, entity = t.name, items = items})
     else
@@ -160,16 +177,18 @@ commands.add_command("fac_companion_stop_all", nil, function(cmd)
       stopped[#stopped + 1] = "craft"
     end
     if storage.build_queues and storage.build_queues[id] then
-      storage.build_queues[id] = nil
+      -- Delegate rather than dropping the table directly: stop_build also records
+      -- finish_build(..., "stopped") into storage.build_results, which a stop_all used to skip -
+      -- a building_place_status poll right after a stop otherwise reads the PREVIOUS run's result.
+      queues.stop_build(id)
       stopped[#stopped + 1] = "build"
     end
     if storage.combat_queues and storage.combat_queues[id] then
-      -- Persist the round's kills before dropping the queue, else a stop_all mid-fight
-      -- silently discards the total (same fix as stop_combat/process_queue's on_drop).
-      local q = storage.combat_queues[id]
-      storage.combat_results = storage.combat_results or {}
-      storage.combat_results[id] = {kills = q.kills or 0, uncaused = q.uncaused or 0, ended_tick = game.tick}
-      storage.combat_queues[id] = nil
+      -- Delegate rather than dropping the table directly: stop_combat also persists the round's
+      -- kills into storage.combat_results (same reasoning as the build queue above) AND clears
+      -- shooting_state - a stop_all used to leave shooting_enemies latched with the queue gone,
+      -- so nothing left in the mod would ever un-stick a companion stopped mid-fight.
+      queues.stop_combat(id)
       stopped[#stopped + 1] = "combat"
     end
     if storage.walking_queues and storage.walking_queues[id] then

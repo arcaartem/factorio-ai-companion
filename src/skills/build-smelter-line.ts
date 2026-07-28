@@ -1,7 +1,8 @@
 // Skill: Build Smelter Line
 // Creates a line of furnaces with inserters for automated smelting
 
-import { SkillContext, SkillResult, Position, exec } from "./index";
+import type { SkillContext, SkillResult, Position } from "./index";
+import { exec } from "./index";
 import { sleep } from "../utils/connection";
 
 const POLL_INTERVAL = 500;
@@ -56,6 +57,36 @@ async function walkTo(ctx: SkillContext, x: number, y: number): Promise<boolean>
     await sleep(POLL_INTERVAL);
   }
   return false;
+}
+
+// building_can_place's out-of-reach reply carries {can_place:false, error:"Too far", target}
+// alongside its plain "blocked" case, but the shared `exec` (./index) throws on any `error`
+// field - which would discard `target` before this skill ever saw it. Read the raw response
+// instead so a reach refusal can be told apart from a real placement conflict and retried once,
+// mirroring mine-until.ts's walk-to-result.target-and-retry.
+async function execRaw(ctx: SkillContext, command: string): Promise<any> {
+  const response = await ctx.rcon.sendCommand(command);
+  if (!response.success || !response.data) return null;
+  try {
+    return JSON.parse(response.data);
+  } catch {
+    return response.data;
+  }
+}
+
+async function checkPlaceable(ctx: SkillContext, command: string): Promise<{ ok: boolean; reason?: string }> {
+  let result = await execRaw(ctx, command);
+  if (!result) return { ok: false, reason: "check failed" };
+
+  if (!result.can_place && result.error === "Too far" && result.target) {
+    const arrived = await walkTo(ctx, result.target.x, result.target.y);
+    if (!arrived) return { ok: false, reason: "failed to walk into reach" };
+    result = await execRaw(ctx, command);
+    if (!result) return { ok: false, reason: "check failed" };
+  }
+
+  if (!result.can_place) return { ok: false, reason: result.reason || result.error || "blocked" };
+  return { ok: true };
 }
 
 export interface SmelterLineOptions {
@@ -138,19 +169,21 @@ export async function buildSmelterLine(
       }
     }
 
-    // Check if we can place the furnace
+    // Check if we can place the furnace, walking into reach once if the engine refuses it as
+    // too far (see checkPlaceable) - the standoff walk above is a euclidean estimate, this is
+    // the authoritative fallback for whatever it misses.
+    let furnaceCheck: { ok: boolean; reason?: string };
     try {
-      const canPlace = await exec(
+      furnaceCheck = await checkPlaceable(
         ctx,
         `/fac_building_can_place ${id} ${furnaceType} ${furnacePos.x} ${furnacePos.y}`
       );
-
-      if (!canPlace.can_place) {
-        errors.push(`Cannot place ${furnaceType} at (${furnacePos.x}, ${furnacePos.y}): ${canPlace.reason || "blocked"}`);
-        continue;
-      }
     } catch (e) {
       errors.push(`Check failed for furnace at (${furnacePos.x}, ${furnacePos.y}): ${e}`);
+      continue;
+    }
+    if (!furnaceCheck.ok) {
+      errors.push(`Cannot place ${furnaceType} at (${furnacePos.x}, ${furnacePos.y}): ${furnaceCheck.reason}`);
       continue;
     }
 
@@ -166,12 +199,12 @@ export async function buildSmelterLine(
 
     // Place the inserter
     try {
-      const canPlaceInserter = await exec(
+      const inserterCheck = await checkPlaceable(
         ctx,
         `/fac_building_can_place ${id} inserter ${inserterPos.x} ${inserterPos.y} ${inserterDir}`
       );
 
-      if (canPlaceInserter.can_place) {
+      if (inserterCheck.ok) {
         await exec(
           ctx,
           `/fac_building_place ${id} inserter ${inserterPos.x} ${inserterPos.y} ${inserterDir}`
@@ -179,7 +212,7 @@ export async function buildSmelterLine(
         placed.push(`inserter at (${inserterPos.x}, ${inserterPos.y})`);
         insertersPlaced++;
       } else {
-        errors.push(`Cannot place inserter at (${inserterPos.x}, ${inserterPos.y})`);
+        errors.push(`Cannot place inserter at (${inserterPos.x}, ${inserterPos.y}): ${inserterCheck.reason}`);
       }
     } catch (e) {
       errors.push(`Failed to place inserter at (${inserterPos.x}, ${inserterPos.y}): ${e}`);

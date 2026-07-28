@@ -194,6 +194,16 @@ function checkArity(toolName: string, luaCmd: string, captures: CaptureSpec[]): 
         `placeholder count ${tsCount} (${placeholders.map((p) => p.name).join(",") || "none"}) ` +
         `outside Lua capture range [${mandatoryCount}..${totalCount}] for pattern with ${totalCount} group(s)`,
     });
+  } else if (tsCount < totalCount) {
+    // In-range but short of totalCount: an optional Lua capture that no TS param exposes at
+    // all, so that branch of the Lua command is unreachable through MCP (T-023 (4)).
+    issues.push({
+      tool: toolName,
+      luaCmd,
+      message:
+        `placeholder count ${tsCount} (${placeholders.map((p) => p.name).join(",") || "none"}) ` +
+        `leaves ${totalCount - tsCount} optional Lua capture(s) unexposed - no TS param can ever reach them`,
+    });
   }
 
   // Positional type check: a Lua capture group whose character class is

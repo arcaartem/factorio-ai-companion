@@ -12,6 +12,10 @@ local ATTACK_RANGE = 6
 local HARVEST_STALL_TICKS = 900 -- 15s with no harvested-count progress = give up (last-resort
                                  -- exit; the reach/movement-yield paths can legitimately block
                                  -- forever, e.g. a latched "no_path" walk queue)
+local COMBAT_LEASH_DIST = 30    -- tiles from the round's origin before the chase gives up -
+                                 -- same last-resort role as HARVEST_STALL_TICKS: the chase is a
+                                 -- raw bearing walk with no pathfinding, so nothing else bounds it
+local COMBAT_STALL_TICKS = 600  -- 10s without closing distance on the current target = give up
 local UNCAUSED_DEATH_RADIUS = 20 -- bounds the q.uncaused diagnostic to queues whose companion is plausibly
                                   -- involved in a given unattributed death, so one stray death doesn't
                                   -- inflate the count on every OTHER active combat queue too (see handle_entity_died)
@@ -755,9 +759,29 @@ end
 
 -- ============ COMBAT ============
 
+-- Terminates a combat queue and records its outcome so a poll arriving AFTER the queue is
+-- gone (M.get_combat_status finding storage.combat_queues[cid] == nil) can still read the
+-- final kill count and why it stopped - the queue itself is deleted by the caller
+-- (process_queue's to_remove, M.stop_combat, or the on_drop handler below), not here.
+-- Clears both shooting_state and walking_state: the chase drives walking_state directly with
+-- no walk queue behind it, so giving up here without clearing it would otherwise leave the
+-- companion walking toward the abandoned target forever - nothing else would ever touch it.
+local function finish_combat(cid, q, c, reason)
+  if c then
+    c.entity.shooting_state = {state = defines.shooting.not_shooting}
+    c.entity.walking_state = {walking = false}
+  end
+  storage.combat_results = storage.combat_results or {}
+  storage.combat_results[cid] = {kills = q.kills or 0, uncaused = q.uncaused or 0, reason = reason, ended_tick = game.tick}
+  return true
+end
+
 function M.start_combat(cid, target_pos)
   local c = valid_companion(cid)
   if not c then return {error = "Invalid companion"} end
+
+  local reach_err = u.check_reach(cid, c, target_pos)
+  if reach_err then return reach_err end
 
   -- Pick up whatever's already in the companion's own inventory (e.g. via item_pick /
   -- building_empty since spawning) before failing - "use what you have" needs no new command.
@@ -782,7 +806,10 @@ function M.start_combat(cid, target_pos)
     current = enemies[1],
     cooldown = 0,
     kills = 0,
-    uncaused = 0
+    uncaused = 0,
+    -- Leash origin: where the whole fight began, not per-target - see COMBAT_LEASH_DIST.
+    origin = {x = c.entity.position.x, y = c.entity.position.y},
+    stall_tick = game.tick
   }
   -- kills is per-round, so drop the previous round's result: a poll on this round must not
   -- be able to read a stale total from the last one.
@@ -845,17 +872,29 @@ function M.tick_combat_queues()
       q.targets = valid_targets
 
       if #q.targets == 0 then
-        c.entity.shooting_state = {state = defines.shooting.not_shooting}
-        -- The round ends on this same tick the queue is torn down, so without persisting
-        -- here the final kill(s) could never be read back.
-        storage.combat_results = storage.combat_results or {}
-        storage.combat_results[cid] = {kills = q.kills or 0, uncaused = q.uncaused or 0, ended_tick = game.tick}
-        return true
+        return finish_combat(cid, q, c, "cleared")
       end
       q.current = table.remove(q.targets, 1)
+      q.best_dist = nil
+      q.stall_tick = game.tick
+    end
+
+    -- Leash + stall: the chase below is a raw bearing walk (walking_state, not
+    -- request_path), so a target across water or behind a cliff would otherwise be pressed
+    -- into forever - there is no walk queue here for STUCK_TICKS to catch. Bound how far the
+    -- whole fight can drag the companion from where it started, and give up on a target that
+    -- has stopped getting any closer.
+    if u.distance(c.entity.position, q.origin) > COMBAT_LEASH_DIST then
+      return finish_combat(cid, q, c, "leashed")
     end
 
     local dist = u.distance(c.entity.position, q.current.position)
+    if not q.best_dist or dist < q.best_dist then
+      q.best_dist = dist
+      q.stall_tick = game.tick
+    elseif game.tick - q.stall_tick >= COMBAT_STALL_TICKS then
+      return finish_combat(cid, q, c, "stalled")
+    end
 
     if dist <= ATTACK_RANGE then
       c.entity.shooting_state = {
@@ -871,9 +910,9 @@ function M.tick_combat_queues()
     return false
   end, function(cid, q)
     -- Companion died/vanished mid-fight: persist the round's kills before process_queue
-    -- drops the queue, else stop_combat/get_combat_status could never read them back.
-    storage.combat_results = storage.combat_results or {}
-    storage.combat_results[cid] = {kills = q.kills or 0, uncaused = q.uncaused or 0, ended_tick = game.tick}
+    -- drops the queue, else stop_combat/get_combat_status could never read them back. No
+    -- entity to clear state on, hence c = nil.
+    finish_combat(cid, q, nil, "stopped")
   end)
 end
 
@@ -886,7 +925,8 @@ function M.get_combat_status(cid)
       active = false,
       kills = last and last.kills or 0,
       ended_tick = last and last.ended_tick or nil,
-      uncaused_deaths = last and last.uncaused or 0
+      uncaused_deaths = last and last.uncaused or 0,
+      reason = last and last.reason or nil
     }
   end
 
@@ -903,28 +943,27 @@ function M.get_combat_status(cid)
 end
 
 function M.stop_combat(cid)
+  local c = valid_companion(cid)
+  -- Unconditional, before the queue check below: fac_action_attack (action.lua) sets
+  -- shooting_state directly and creates no combat_queues entry at all, so this is the only
+  -- place able to clear that latch when there is no queue to find.
+  if c then c.entity.shooting_state = {state = defines.shooting.not_shooting} end
+
   local q = storage.combat_queues[cid]
   if not q then
     -- The queue may have completed (or dropped, see process_queue's on_drop) just before
     -- this stop arrived - read the persisted total instead of hard-coding zero.
     local last = (storage.combat_results or {})[cid]
-    return {stopped = false, kills = last and last.kills or 0, uncaused_deaths = last and last.uncaused or 0}
-  end
-
-  local c = valid_companion(cid)
-  if c then
-    c.entity.shooting_state = {state = defines.shooting.not_shooting}
-    c.entity.walking_state = {walking = false}
+    return {stopped = false, kills = last and last.kills or 0, uncaused_deaths = last and last.uncaused or 0, reason = last and last.reason or nil}
   end
 
   -- combat.lua's wrapper has always reported `result.kills or 0`; until now this returned
   -- no kills at all, so an interrupted round (the low-health retreat) always read as zero.
   local kills = q.kills or 0
   local uncaused = q.uncaused or 0
-  storage.combat_results = storage.combat_results or {}
-  storage.combat_results[cid] = {kills = kills, uncaused = uncaused, ended_tick = game.tick}
-
   storage.combat_queues[cid] = nil
+  finish_combat(cid, q, c, "stopped")
+
   return {stopped = true, kills = kills, uncaused_deaths = uncaused}
 end
 

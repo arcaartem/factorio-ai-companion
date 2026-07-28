@@ -11,7 +11,14 @@ commands.add_command("fac_building_can_place", nil, function(cmd)
     local dir = u.dir_map[tonumber(args[5]) or 0] or defines.direction.north
     if not x or not y then u.error_response("Invalid coordinates"); return end
     local reach_err = u.check_reach(id, c, {x=x, y=y})
-    if reach_err then u.json_response(reach_err); return end
+    if reach_err then
+      -- can_place alongside the shared reach payload, not instead of it - t022 asserts both
+      -- error == "Too far" and can_place ~= true, and check_reach's own payload stays untouched
+      -- (mining refusals share it and have no meaningful can_place to add).
+      reach_err.can_place = false
+      u.json_response(reach_err)
+      return
+    end
     local inv = c.entity.get_inventory(defines.inventory.character_main)
     if inv.get_item_count(name) == 0 then u.json_response({id = id, can_place = false, reason = "Not in inventory"}); return end
     local can = c.entity.surface.can_place_entity{name = name, position = {x=x, y=y}, direction = dir, force = c.entity.force}
@@ -154,8 +161,8 @@ commands.add_command("fac_building_fuel", nil, function(cmd)
     local id, c = u.find_companion(args[1])
     if not id then u.error_response("Companion not found"); return end
     local fuel, amount = args[2], tonumber(args[3]) or 5
-    local explicit_pos = tonumber(args[4]) and tonumber(args[5])
-    local pos = explicit_pos and {x = tonumber(args[4]), y = tonumber(args[5])} or c.entity.position
+    local pos, pos_err = u.optional_position(id, c, args[4], args[5])
+    if not pos then u.json_response(pos_err); return end
     local inv = c.entity.get_inventory(defines.inventory.character_main)
     local have = inv.get_item_count(fuel)
     if have == 0 then u.json_response({id = id, error = "No " .. fuel}); return end
@@ -187,8 +194,8 @@ commands.add_command("fac_building_empty", nil, function(cmd)
     if not count or count <= 0 then
       u.json_response({id = id, error = "count must be positive"}); return
     end
-    local explicit_pos = tonumber(args[4]) and tonumber(args[5])
-    local pos = explicit_pos and {x = tonumber(args[4]), y = tonumber(args[5])} or c.entity.position
+    local pos, pos_err = u.optional_position(id, c, args[4], args[5])
+    if not pos then u.json_response(pos_err); return end
     local entity_name = args[6] ~= "" and args[6] or nil
     -- include neutral so crash-site wreckage and other unowned containers are reachable;
     -- excluding characters (resolve_target's default) closes the hole where an unrestricted
@@ -264,8 +271,8 @@ commands.add_command("fac_building_fill", nil, function(cmd)
     if not count or count <= 0 then
       u.json_response({id = id, error = "count must be positive"}); return
     end
-    local explicit_pos = tonumber(args[4]) and tonumber(args[5])
-    local pos = explicit_pos and {x = tonumber(args[4]), y = tonumber(args[5])} or c.entity.position
+    local pos, pos_err = u.optional_position(id, c, args[4], args[5])
+    if not pos then u.json_response(pos_err); return end
     local entity_name = args[6] ~= "" and args[6] or nil
     local inv = c.entity.get_inventory(defines.inventory.character_main)
     local have = inv.get_item_count(item)

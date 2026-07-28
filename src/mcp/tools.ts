@@ -37,14 +37,21 @@ export const TOOLS: Record<string, {
     params: { companionId: { type: "number", required: true } }
   },
   companion_inventory: {
-    desc: "Get companion inventory contents",
-    rcon: "/fac_companion_inventory {companionId}",
-    params: { companionId: { type: "number", required: true } }
+    desc: "Get companion inventory contents, or the contents of a nearby chest/furnace by passing x/y",
+    rcon: "/fac_companion_inventory {companionId} {x} {y}",
+    params: {
+      companionId: { type: "number", required: true },
+      x: { type: "number", desc: "Optional: with y, inspect the nearest container near this position instead of the companion's own inventory", required: false },
+      y: { type: "number", required: false }
+    }
   },
   companion_health: {
-    desc: "Get companion health status",
-    rcon: "/fac_companion_health {companionId}",
-    params: { companionId: { type: "number", required: true } }
+    desc: "Get companion health status, optionally a player name or companion id's health too",
+    rcon: "/fac_companion_health {companionId} {target}",
+    params: {
+      companionId: { type: "number", required: true },
+      target: { type: "string", desc: "Optional: player name or companion id to also report health for", required: false, default: "" }
+    }
   },
   companion_disappear: {
     desc: "Despawn a companion (drops items)",
@@ -91,11 +98,11 @@ export const TOOLS: Record<string, {
   },
   resource_list: {
     desc: "List nearby resources around companion",
-    rcon: "/fac_resource_list {companionId} {filter} {radius}",
+    rcon: "/fac_resource_list {companionId} {radius} {filter}",
     params: {
       companionId: { type: "number", required: true },
-      filter: { type: "string", desc: "Optional: filter by resource type", default: "" },
-      radius: { type: "number", desc: "Search radius", default: 50 }
+      radius: { type: "number", desc: "Search radius", default: 50 },
+      filter: { type: "string", desc: "Optional: filter by resource type", default: "" }
     }
   },
   resource_mine: {
@@ -166,8 +173,11 @@ export const TOOLS: Record<string, {
   },
   item_recipes: {
     desc: "List available recipes for companion",
-    rcon: "/fac_item_recipes {companionId}",
-    params: { companionId: { type: "number", required: true } }
+    rcon: "/fac_item_recipes {companionId} {filter}",
+    params: {
+      companionId: { type: "number", required: true },
+      filter: { type: "string", desc: "Optional: substring match on recipe name, or \"active\" for only currently-craftable recipes", required: false, default: "" }
+    }
   },
 
   // World
@@ -305,8 +315,8 @@ export const TOOLS: Record<string, {
     rcon: "/fac_building_fill {companionId} {itemName} {count} {x} {y} {entityName}",
     params: {
       companionId: { type: "number", required: true },
-      x: { type: "number", required: true },
-      y: { type: "number", required: true },
+      x: { type: "number", required: false },
+      y: { type: "number", required: false },
       itemName: { type: "string", required: true },
       count: { type: "number", required: true },
       entityName: { type: "string", desc: "Optional: restrict to this entity name", required: false, default: "" }
@@ -382,8 +392,11 @@ export const TOOLS: Record<string, {
   },
   research_progress: {
     desc: "Get research progress",
-    rcon: "/fac_research_progress {companionId}",
-    params: { companionId: { type: "number", required: true } }
+    rcon: "/fac_research_progress {companionId} {technology}",
+    params: {
+      companionId: { type: "number", required: true },
+      technology: { type: "string", desc: "Optional: technology name; defaults to the current research", required: false, default: "" }
+    }
   },
 
   // Context

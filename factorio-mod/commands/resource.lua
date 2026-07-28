@@ -7,20 +7,38 @@ local queues = require("commands.queues")
 
 commands.add_command("fac_resource_list", nil, function(cmd)
   u.safe_command(function()
-    local args = u.parse_args("^(%S+)%s*(%S*)%s*(%d*)$", cmd.parameter)
+    -- radius before filter: filter is optional and radius is always populated, and
+    -- buildRCONCommand collapses whitespace, so the reverse order let an omitted filter's blank
+    -- slot vanish and bound radius's digits into the filter capture instead (frozen contract,
+    -- matches the TS-side template change).
+    local args = u.parse_args("^(%S+)%s*(%d*)%s*(%S*)$", cmd.parameter)
     local id, c = u.find_companion(args[1])
     if not id then u.error_response("Companion not found"); return end
-    local filter = args[2] ~= "" and args[2] or nil
-    local radius = tonumber(args[3]) or 50
+    local radius = tonumber(args[2]) or 50
+    local filter = args[3] ~= "" and args[3] or nil
     local pos = c.entity.position
-    local res = c.entity.surface.find_entities_filtered{type = "resource", position = pos, radius = radius, limit = 20}
+    -- Push the filter INTO find_entities_filtered rather than applying it after a limited scan -
+    -- the engine's `limit` truncates in chunk order, with no distance ordering (same defect
+    -- resource_nearest/world_nearest had before 0.17.0), so "scan wide with a limit, then filter
+    -- and sort" returned an arbitrary sample and a filtered call could read count=0 even with
+    -- matches on the map. No limit here; sort first, then truncate to 20 in Lua below.
+    local search = {position = pos, radius = radius}
+    if filter then
+      for k, v in pairs(u.resource_filter(filter)) do search[k] = v end
+    else
+      search.type = "resource"
+    end
+    local res = c.entity.surface.find_entities_filtered(search)
     local found = {}
     for _, r in ipairs(res) do
-      if not filter or r.name == filter then
-        found[#found + 1] = {name = r.name, position = {x = r.position.x, y = r.position.y}, amount = r.amount, distance = math.floor(u.distance(pos, r.position))}
-      end
+      local entry = {name = r.name, position = {x = r.position.x, y = r.position.y}, distance = math.floor(u.distance(pos, r.position))}
+      -- amount is a resource-only LuaEntity property and raises on a tree - report it only for
+      -- entities that actually carry one, exactly as resource_nearest does.
+      if r.type == "resource" then entry.amount = r.amount end
+      found[#found + 1] = entry
     end
     table.sort(found, function(a, b) return a.distance < b.distance end)
+    while #found > 20 do table.remove(found) end
     u.json_response({id = id, resources = found, count = #found})
   end)
 end)

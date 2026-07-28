@@ -65,6 +65,10 @@ function M.get_companion(id)
 end
 
 function M.find_companion(identifier)
+  -- A quoted-name argument containing a space makes the caller's parse_args pattern fail to
+  -- match entirely, so identifier arrives nil rather than "" - guard before :lower() raises.
+  -- Full quoted-name support is a separate change; this only turns the raise into "not found".
+  if identifier == nil then return nil, nil end
   local id = tonumber(identifier)
   if id then
     local c = M.get_companion(id)
@@ -204,6 +208,26 @@ function M.resolve_target(id, c, pos, opts)
   return best, nil
 end
 
+-- Parses an optional trailing x/y pair (building.lua's fuel/empty/fill all take one), matching
+-- resolve_target's (value, err) convention. xs/ys are the raw parse_args captures, which can each
+-- independently be nil (the whole pattern failed to match), "" (the slot was omitted) or a
+-- non-numeric fragment ("1-2", "..." - the coordinate patterns admit those). Both empty falls
+-- back to the companion's own position (the old behaviour); exactly one empty, or either half
+-- failing tonumber, used to silently discard the caller's coordinate and substitute the
+-- companion's feet with no error at all - now a structured refusal instead.
+function M.optional_position(id, c, xs, ys)
+  xs, ys = xs or "", ys or ""
+  if xs == "" and ys == "" then return c.entity.position, nil end
+  if (xs ~= "") ~= (ys ~= "") then
+    return nil, {id = id, error = "Incomplete position: need both x and y"}
+  end
+  local x, y = tonumber(xs), tonumber(ys)
+  if not x or not y then
+    return nil, {id = id, error = "Invalid position", x = xs, y = ys}
+  end
+  return {x = x, y = y}, nil
+end
+
 -- Tile equivalent (water). Returns the tile's position (LuaTile has no stable handle worth
 -- returning) and its distance, or nil.
 function M.find_nearest_tile(surface, pos, names)
@@ -230,7 +254,10 @@ function M.check_reach(id, c, pos, kind)
   if kind == "resource" then
     limit = c.entity.resource_reach_distance or 10
   elseif kind == "item" then
-    limit = c.entity.item_pickup_distance or c.entity.reach_distance or 10
+    -- loot_pickup_distance (2), not item_pickup_distance (1): the engine already vacuums ground
+    -- items passively at loot_pickup_distance, so binding the explicit pickup command tighter
+    -- than that would make asking for an item STRICTER than doing nothing.
+    limit = c.entity.loot_pickup_distance or c.entity.reach_distance or 10
   else
     limit = c.entity.reach_distance or 10
   end
