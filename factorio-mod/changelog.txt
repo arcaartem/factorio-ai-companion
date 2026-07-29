@@ -1,4 +1,64 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.22.0
+Date: 2026-07-29
+  Bugfixes:
+    - The on_nth_tick queue handlers are no longer unprotected. tick_harvest/craft/build/combat/
+      walk_queues, cleanup_messages and update_companion_markers all ran with no pcall, unlike
+      every /fac_* command, so a single raise inside a tick handler was an uncaught error in an
+      event handler - which takes the whole mod down in a hosted multiplayer game. The two bare
+      script.on_event handlers (on_script_path_request_finished, on_entity_died) had the same
+      exposure; on_entity_died is filtered to unit/unit-spawner/turret and so fires on every such
+      death map-wide, making it the highest-frequency unprotected path in the mod.
+    - The protection is per QUEUE ENTRY, inside process_queue, not per handler - and an entry that
+      raises is force-removed. A pcall that merely swallowed the error would have been worse than
+      no pcall: tick_build_queues debits the item before it calls create_entity, pcall does not
+      roll that debit back, and process_queue defers deletion to after the loop - so a surviving
+      entry with an unchanged tick_start re-debits every 5 ticks until the inventory is empty.
+      Per-entry scoping also stops one poisoned companion id aborting the pairs() walk and
+      starving every later companion in the same table.
+    - to_remove is appended to BEFORE the on_error/on_drop recorders run, and each recorder is
+      its own pcall with its own logged context. The recorders write entity state that has
+      already proven capable of raising (they run precisely because the processor raised or the
+      companion went invalid), so a raise inside one previously escaped process_queue entirely -
+      skipping not just that entry's removal but the trailing removal loop for every other entry
+      queued on the same tick. That reinstated the drain loop above, relocated into the handler
+      meant to contain it.
+    - create_entity in tick_build_queues gets its own narrower pcall on top of that, so a raise
+      there falls through to the existing refund-then-"blocked" path instead of reaching the
+      generic containment with the item debited and no refund.
+    - fac_research_set no longer claims to be researching a technology it merely queued.
+      force.add_research APPENDS to the research queue rather than preempting it, but the reply
+      unconditionally echoed the requested name as {researching = <name>} - so with any research
+      already in progress the named technology sat behind the incumbent while the reply asserted
+      the opposite. In T-002 that spent 8 of 10 hand-crafted science packs on the wrong
+      technology. The reply is now built from the queue position read back AFTER the call, never
+      from add_research's own boolean (which cannot distinguish "became current" from "queued
+      behind an incumbent" from "already queued").
+  Changes:
+    - New u.safe_tick(ctx, fn) for tick and event context: pcall plus a logged error, with no
+      rcon.print. u.safe_command is unusable there - it answers over RCON, and with no request in
+      flight during on_nth_tick that either no-ops or emits an uncorrelated frame into the next
+      response, which the TS client correlates by request id.
+    - fac_research_set's reply distinguishes queued from researching. It carries
+      {researching, position = 1} only when the technology genuinely became the current research
+      (the queue was empty), and {queued, position, current} - with NO researching key at all -
+      when it landed behind an incumbent. A technology already in the queue reports the same
+      shape plus already_queued = true rather than the old {error = "Failed"}: add_research
+      returns false in that case, but the technology IS queued, so "Failed" was untrue.
+      Appending onto an EMPTY queue stays correct and its reply shape is unchanged - repeated
+      calls remain a usable queue-builder, which is why this is not a change to preemption.
+    - fac_research_get now returns queue (name + units, in queue order) and queue_count. It
+      previously exposed only current and available, so a multi-call research_set sequence could
+      not be confirmed through the tool surface at all.
+    - The craft queue records its outcome before its queue entry is deleted, like harvest, build
+      and combat already did. New storage.craft_results, surfaced by fac_item_craft_status, with
+      reasons target_reached / missing_ingredients / stopped / error. Previously a finished craft
+      left a bare {active = false} that could equally mean "finished fine" or "never ran", and
+      the ran-out-of-ingredients path recorded nothing at all.
+    - harvest, build and combat results carry an `error` field, surfaced by their *_status
+      commands, populated only on the new "error" reason.
+
+---------------------------------------------------------------------------------------------------
 Version: 0.21.1
 Date: 2026-07-28
   Bugfixes:

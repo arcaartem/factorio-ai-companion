@@ -378,12 +378,15 @@ export const TOOLS: Record<string, {
   },
   // Research
   research_get: {
-    desc: "Get current research status",
+    desc: "Get current research, available technologies, and the research queue (in order)",
     rcon: "/fac_research_get {companionId}",
     params: { companionId: { type: "number", required: true } }
   },
   research_set: {
-    desc: "Set research target",
+    desc: "Add a technology to the research queue. Appends, does not preempt: it only becomes " +
+      "the current research if the queue was empty, otherwise it queues behind whatever is " +
+      "already researching. Reply carries `researching` when it became current, or `queued` " +
+      "(never both) with its queue `position` otherwise",
     rcon: "/fac_research_set {companionId} {technology}",
     params: {
       companionId: { type: "number", required: true },

@@ -59,6 +59,16 @@ function M.safe_command(callback)
   end
 end
 
+-- Tick/event-context wrapper: pcall + logged error, with NO rcon.print. safe_command's
+-- error_response assumes an RCON request is in flight to reply to; on_nth_tick and bare
+-- script.on_event handlers have no such request, so calling it here would either no-op or
+-- emit an uncorrelated frame the TS client (which correlates responses by request id, see
+-- CLAUDE.md) has no way to match. ctx is a plain string, filed into storage.errors as-is.
+function M.safe_tick(ctx, fn)
+  local ok, err = pcall(fn)
+  if not ok then M.log_error(err, ctx) end
+end
+
 function M.get_companion(id)
   local c = storage.companions[id]
   return (c and c.entity and c.entity.valid) and c or nil

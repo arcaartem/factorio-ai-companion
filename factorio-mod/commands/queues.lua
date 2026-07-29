@@ -38,7 +38,29 @@ end
 -- on_drop(cid, q), if given, runs when the companion itself has become invalid (died,
 -- despawned) right before its queue entry is discarded - the combat queue uses this to
 -- persist the round's kills, which would otherwise vanish along with the queue.
-local function process_queue(queue_name, processor, on_drop)
+-- on_error(cid, q, c, err), if given, runs when processor(cid, q, c) raises.
+--
+-- processor is pcall-wrapped PER ENTRY, not once for the whole queue: a naive pcall around
+-- the processor call that simply swallowed the error (should_remove = false, "try again next
+-- tick") would be worse than no pcall at all for a queue whose processor debits state before
+-- it can raise (tick_build_queues removes the item before create_entity) - the debit is not
+-- rolled back by pcall, the entry survives to the next tick with the debit already spent, and
+-- it re-debits every 5 ticks until the source inventory is empty. So an error unconditionally
+-- forces the entry into to_remove; on_error exists to let the caller record why before the
+-- NEXT tick, per the "outcome recorded before the queue is deleted" rule the normal
+-- termination paths already follow.
+--
+-- to_remove is appended to BEFORE on_error/on_drop run, not after - both handlers write to
+-- entity state that has already proven capable of raising (they run specifically because the
+-- processor raised, or the companion went invalid), and each is its own pcall with its own
+-- logged context, so a raise INSIDE the recorder can no longer suppress the removal it was
+-- supposed to precede. Before this, a raising on_error/on_drop propagated out of
+-- process_queue entirely - skipping not just this entry's removal but the trailing removal
+-- loop for every OTHER entry queued on the same tick, reinstating the exact per-5-tick drain
+-- this whole function exists to prevent, just moved into the error handler instead of the
+-- processor. Per-entry scoping also means one poisoned cid can no longer abort the whole
+-- pairs() walk and starve every later companion in the table.
+local function process_queue(queue_name, processor, on_drop, on_error)
   local queues = storage[queue_name]
   if not queues then return end
 
@@ -46,11 +68,26 @@ local function process_queue(queue_name, processor, on_drop)
   for cid, q in pairs(queues) do
     local c = valid_companion(cid)
     if not c then
-      if on_drop then on_drop(cid, q) end
       to_remove[#to_remove + 1] = cid
+      if on_drop then
+        local drop_ok, drop_err = pcall(on_drop, cid, q)
+        if not drop_ok then u.log_error(drop_err, queue_name .. ":on_drop:" .. cid) end
+      end
     else
-      local should_remove = processor(cid, q, c)
-      if should_remove then to_remove[#to_remove + 1] = cid end
+      local ok, result = pcall(processor, cid, q, c)
+      if ok then
+        if result then to_remove[#to_remove + 1] = cid end
+      else
+        -- Original raise is always logged, regardless of what on_error does below - a second
+        -- failure inside the recorder gets its OWN log entry (distinct context) rather than
+        -- swallowing this one.
+        u.log_error(result, queue_name .. ":" .. cid)
+        to_remove[#to_remove + 1] = cid
+        if on_error then
+          local err_ok, err_err = pcall(on_error, cid, q, c, result)
+          if not err_ok then u.log_error(err_err, queue_name .. ":on_error:" .. cid) end
+        end
+      end
     end
   end
 
@@ -68,6 +105,8 @@ function M.init()
   -- Outcome of the last finished async build per companion, for the same reason: the build
   -- queue is deleted the same tick create_entity's result is known.
   storage.build_results = storage.build_results or {}
+  -- Outcome of the last finished craft run per companion, same reason (T-050).
+  storage.craft_results = storage.craft_results or {}
 end
 
 -- ============ WALK ============
@@ -335,6 +374,18 @@ function M.tick_walk_queues()
     end
 
     return false
+  end, nil, function(cid, q, c, err)
+    -- No result table (unlike harvest/build/craft/combat): move.lua exposes no dedicated
+    -- poll-only status command - get_walk_status(cid) is only ever called from inside
+    -- start_walk/start_follow, which either read back an EXISTING queue (the idempotent-poll
+    -- branch) or create a brand new one immediately before reading status, so its "no queue"
+    -- branch is unreachable through any /fac_* command today. A result table here would be
+    -- outside-the-mod-invisible dead code. process_queue's own u.log_error call already files
+    -- the raise into storage.errors; this handler's job is just containment - stop the
+    -- companion in place and drop the pending path request rather than leaving it mid-stride
+    -- with a walking_state nothing will ever revisit.
+    cancel_request(q)
+    if c then c.entity.walking_state = {walking = false} end
   end)
 end
 
@@ -344,12 +395,12 @@ end
 -- gone (M.get_harvest_status finding storage.harvest_queues[cid] == nil) can still read the
 -- final harvested count and why it stopped - the queue itself is deleted by the caller
 -- (process_queue's to_remove, or M.stop_harvest directly), not here.
-local function finish_harvest(cid, q, c, reason)
+local function finish_harvest(cid, q, c, reason, err)
   c.entity.mining_state = {mining = false}
   -- Nil-guard: control-stage reload does not run on_configuration_changed, so a save from
   -- before this field existed never gets it from init_storage.
   storage.harvest_results = storage.harvest_results or {}
-  storage.harvest_results[cid] = {harvested = q.harvested, target = q.target, reason = reason, tick = game.tick}
+  storage.harvest_results[cid] = {harvested = q.harvested, target = q.target, reason = reason, tick = game.tick, error = err}
   return true
 end
 
@@ -514,6 +565,8 @@ function M.tick_harvest_queues()
     end
 
     return false
+  end, nil, function(cid, q, c, err)
+    finish_harvest(cid, q, c, "error", tostring(err))
   end)
 end
 
@@ -524,7 +577,7 @@ function M.get_harvest_status(cid)
     -- that can still see the final count is the outcome finish_harvest recorded.
     local last = (storage.harvest_results or {})[cid]
     if last then
-      return {active = false, harvested = last.harvested, target = last.target, reason = last.reason}
+      return {active = false, harvested = last.harvested, target = last.target, reason = last.reason, error = last.error}
     end
     return {active = false}
   end
@@ -551,6 +604,17 @@ end
 
 -- ============ CRAFT ============
 
+-- Terminates a craft queue and records its outcome so a poll arriving AFTER the queue is
+-- gone can still read the final crafted count and why it stopped - same outcome-before-
+-- deletion rule as harvest/build/combat (T-050 widened craft to follow it too: before this,
+-- the "recipe ran out of ingredients mid-run" and "raised" paths recorded nothing at all,
+-- and a bare {active=false} could mean "finished fine" or "never ran" with no way to tell).
+local function finish_craft(cid, q, reason, err)
+  storage.craft_results = storage.craft_results or {}
+  storage.craft_results[cid] = {crafted = q.crafted, target = q.target, recipe = q.recipe, reason = reason, tick = game.tick, error = err}
+  return true
+end
+
 function M.start_craft(cid, recipe, count)
   local c = valid_companion(cid)
   if not c then return {error = "Invalid companion"} end
@@ -571,6 +635,10 @@ function M.start_craft(cid, recipe, count)
     ticks_per = ticks,
     tick_start = game.tick
   }
+  -- Drop any stale result from a previous run - a poll on this new run must never be able to
+  -- read a leftover outcome that belongs to the last one.
+  storage.craft_results = storage.craft_results or {}
+  storage.craft_results[cid] = nil
 
   return {started = true, recipe = recipe, target = actual, ticks_per = ticks}
 end
@@ -581,17 +649,28 @@ function M.tick_craft_queues()
     if elapsed < q.ticks_per then return false end
 
     local crafted = c.entity.begin_crafting{recipe = q.recipe, count = 1}
-    if crafted < 1 then return true end
+    if crafted < 1 then return finish_craft(cid, q, "missing_ingredients") end
 
     q.crafted = q.crafted + 1
     q.tick_start = game.tick
-    return q.crafted >= q.target
+    if q.crafted >= q.target then return finish_craft(cid, q, "target_reached") end
+    return false
+  end, function(cid, q)
+    finish_craft(cid, q, "stopped")
+  end, function(cid, q, c, err)
+    finish_craft(cid, q, "error", tostring(err))
   end)
 end
 
 function M.get_craft_status(cid)
   local q = storage.craft_queues[cid]
-  if not q then return {active = false} end
+  if not q then
+    local last = (storage.craft_results or {})[cid]
+    if last then
+      return {active = false, crafted = last.crafted, target = last.target, recipe = last.recipe, reason = last.reason, error = last.error}
+    end
+    return {active = false}
+  end
   return {
     active = true,
     recipe = q.recipe,
@@ -605,6 +684,7 @@ function M.stop_craft(cid)
   local q = storage.craft_queues[cid]
   if not q then return {stopped = false} end
   local crafted = q.crafted
+  finish_craft(cid, q, "stopped")
   storage.craft_queues[cid] = nil
   return {stopped = true, crafted = crafted}
 end
@@ -615,7 +695,7 @@ end
 -- gone (M.get_build_status finding storage.build_queues[cid] == nil) can still read where
 -- the entity actually landed - the queue itself is deleted by the caller (process_queue's
 -- to_remove, or M.stop_build directly), not here.
-local function finish_build(cid, q, c, placed_entity, reason)
+local function finish_build(cid, q, c, placed_entity, reason, err)
   storage.build_results = storage.build_results or {}
   -- create_entity can snap to a different tile than requested - report the real position
   -- when something was actually placed, the request otherwise (nothing to report instead).
@@ -630,7 +710,8 @@ local function finish_build(cid, q, c, placed_entity, reason)
     position = position,
     requested = {x = q.position.x, y = q.position.y},
     reason = reason,
-    tick = game.tick
+    tick = game.tick,
+    error = err
   }
   return true
 end
@@ -696,21 +777,32 @@ function M.tick_build_queues()
       return finish_build(cid, q, c, nil, "no_item")
     end
 
-    local placed = surface.create_entity{
-      name = q.entity,
-      position = q.position,
-      direction = q.direction,
-      force = c.entity.force
-    }
+    -- pcall-wrapped specifically (on top of process_queue's own per-entry pcall) so a raise
+    -- from create_entity itself - not just a returned nil - still falls through to the
+    -- refund below rather than skipping it. The debit two lines above already committed;
+    -- without this, a raise here would escape to process_queue's on_error with the item
+    -- gone and no refund, losing exactly one item per fault instead of zero (T-050).
+    local create_ok, placed = pcall(function()
+      return surface.create_entity{
+        name = q.entity,
+        position = q.position,
+        direction = q.direction,
+        force = c.entity.force
+      }
+    end)
+    if not create_ok then
+      u.log_error(placed, "tick_build_queues create_entity:" .. cid)
+      placed = nil
+    end
     if placed then
       return finish_build(cid, q, c, placed, "placed")
     end
 
     -- create_entity can still fail here despite the can_place_entity check above (something
-    -- else claimed the tile between that check and this call). Refund the debit rather than
-    -- destroying the item outright - trading a conjure bug for a destroy bug would not be a
-    -- fix. Removing exactly 1 above guarantees room for exactly 1 back, so this insert cannot
-    -- fail.
+    -- else claimed the tile between that check and this call, or it raised - see above).
+    -- Refund the debit rather than destroying the item outright - trading a conjure bug for
+    -- a destroy bug would not be a fix. Removing exactly 1 above guarantees room for exactly
+    -- 1 back, so this insert cannot fail.
     inv.insert{name = q.entity, count = 1}
     return finish_build(cid, q, c, nil, "blocked")
   end, function(cid, q)
@@ -725,6 +817,8 @@ function M.tick_build_queues()
       reason = "stopped",
       tick = game.tick
     }
+  end, function(cid, q, c, err)
+    finish_build(cid, q, c, nil, "error", tostring(err))
   end)
 end
 
@@ -735,7 +829,7 @@ function M.get_build_status(cid)
     -- that can still see the outcome is what finish_build recorded.
     local last = (storage.build_results or {})[cid]
     if last then
-      return {active = false, placed = last.placed, entity = last.entity, position = last.position, requested = last.requested, reason = last.reason}
+      return {active = false, placed = last.placed, entity = last.entity, position = last.position, requested = last.requested, reason = last.reason, error = last.error}
     end
     return {active = false}
   end
@@ -766,13 +860,13 @@ end
 -- Clears both shooting_state and walking_state: the chase drives walking_state directly with
 -- no walk queue behind it, so giving up here without clearing it would otherwise leave the
 -- companion walking toward the abandoned target forever - nothing else would ever touch it.
-local function finish_combat(cid, q, c, reason)
+local function finish_combat(cid, q, c, reason, err)
   if c then
     c.entity.shooting_state = {state = defines.shooting.not_shooting}
     c.entity.walking_state = {walking = false}
   end
   storage.combat_results = storage.combat_results or {}
-  storage.combat_results[cid] = {kills = q.kills or 0, uncaused = q.uncaused or 0, reason = reason, ended_tick = game.tick}
+  storage.combat_results[cid] = {kills = q.kills or 0, uncaused = q.uncaused or 0, reason = reason, ended_tick = game.tick, error = err}
   return true
 end
 
@@ -913,6 +1007,8 @@ function M.tick_combat_queues()
     -- drops the queue, else stop_combat/get_combat_status could never read them back. No
     -- entity to clear state on, hence c = nil.
     finish_combat(cid, q, nil, "stopped")
+  end, function(cid, q, c, err)
+    finish_combat(cid, q, c, "error", tostring(err))
   end)
 end
 
@@ -926,7 +1022,8 @@ function M.get_combat_status(cid)
       kills = last and last.kills or 0,
       ended_tick = last and last.ended_tick or nil,
       uncaused_deaths = last and last.uncaused or 0,
-      reason = last and last.reason or nil
+      reason = last and last.reason or nil,
+      error = last and last.error or nil
     }
   end
 
@@ -957,7 +1054,7 @@ function M.stop_combat(cid)
     -- The queue may have completed (or dropped, see process_queue's on_drop) just before
     -- this stop arrived - read the persisted total instead of hard-coding zero.
     local last = (storage.combat_results or {})[cid]
-    return {stopped = false, kills = last and last.kills or 0, uncaused_deaths = last and last.uncaused or 0, reason = last and last.reason or nil}
+    return {stopped = false, kills = last and last.kills or 0, uncaused_deaths = last and last.uncaused or 0, reason = last and last.reason or nil, error = last and last.error or nil}
   end
 
   -- combat.lua's wrapper has always reported `result.kills or 0`; until now this returned

@@ -179,23 +179,33 @@ end
 
 -- Pathfinding results arrive asynchronously (LuaSurface::request_path is non-blocking);
 -- hand them off to the walking queue system that tracks the pending request map.
+-- Unprotected, a raise here is an uncaught error in an event handler - takes the whole mod
+-- down in a hosted multiplayer game. safe_tick logs instead of crashing (see its comment).
 script.on_event(defines.events.on_script_path_request_finished, function(event)
-  queues.handle_path_result(event)
+  u.safe_tick("on_script_path_request_finished", function() queues.handle_path_result(event) end)
 end)
 
 -- Kills are credited by attribution (event.cause), not by inferring "the current combat
--- target slot went invalid" - see queues.handle_entity_died.
-script.on_event(defines.events.on_entity_died, function(event) queues.handle_entity_died(event) end,
+-- target slot went invalid" - see queues.handle_entity_died. Filtered to unit/unit-spawner/
+-- turret, so this fires on every such death map-wide - the highest-frequency unprotected
+-- path in the mod before safe_tick.
+script.on_event(defines.events.on_entity_died, function(event)
+  u.safe_tick("on_entity_died", function() queues.handle_entity_died(event) end)
+end,
   {{filter = "type", type = "unit"}, {filter = "type", type = "unit-spawner"}, {filter = "type", type = "turret"}})
 
+-- Each call wrapped individually (not the whole body in one pcall) so one queue's raise
+-- doesn't skip the others on the same tick. Order is load-bearing: walk MUST stay last,
+-- since a mining companion cannot walk (the engine reverts walking_state every tick while
+-- mining_state.mining is true) - see the mining/walking mutual-exclusion note in CLAUDE.md.
 script.on_nth_tick(5, function(ev)
-  if ev.tick % 1800 == 0 then cleanup_messages() end
+  if ev.tick % 1800 == 0 then u.safe_tick("cleanup_messages", cleanup_messages) end
   -- Update map markers every 30 ticks (0.5 sec)
-  if ev.tick % 30 == 0 then update_companion_markers() end
+  if ev.tick % 30 == 0 then u.safe_tick("update_companion_markers", update_companion_markers) end
   -- Process all tick-based queues (realistic actions)
-  queues.tick_harvest_queues()
-  queues.tick_craft_queues()
-  queues.tick_build_queues()
-  queues.tick_combat_queues()
-  queues.tick_walk_queues()
+  u.safe_tick("tick_harvest_queues", queues.tick_harvest_queues)
+  u.safe_tick("tick_craft_queues", queues.tick_craft_queues)
+  u.safe_tick("tick_build_queues", queues.tick_build_queues)
+  u.safe_tick("tick_combat_queues", queues.tick_combat_queues)
+  u.safe_tick("tick_walk_queues", queues.tick_walk_queues)
 end)
