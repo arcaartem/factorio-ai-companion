@@ -309,8 +309,10 @@ while `queues.lua`/`init.lua`/`companion.lua` predated the fixes they were suppo
   `LuaControl::remove_item`, which is not restricted to the main inventory and can drain gun/ammo
   slots; and the `create_entity`-still-nil path must **refund** the debit, or the fix trades a
   conjure bug for a destroy bug. `t043` asserts item counts absolutely on that branch for that
-  reason. Still open on the same code: `stop_all` drops the build queue without recording a result
-  (T-049), and none of the `on_nth_tick` queue handlers is `pcall`-protected (T-050).
+  reason. Both follow-ups on the same code are now CLOSED: `stop_all` records a build result
+  (T-049, 0.21.0), and the `on_nth_tick` handlers are pcall-protected (T-050, 0.22.0) — read the
+  tick-handler note below before touching `process_queue`, since the containment granularity there
+  is load-bearing rather than stylistic.
 - **A smoke suite that only ever ADDS to the companion's inventory will report red against working
   code.** `t043`'s first live run failed its own conjure section because section 1 left 2 furnaces
   behind and section 2 added 1 rather than resetting: the queued build fired with items in hand and
@@ -335,7 +337,47 @@ while `queues.lua`/`init.lua`/`companion.lua` predated the fixes they were suppo
 - **Combat kills are credited by `on_entity_died` attribution, not by inferring from target validity.** `event.cause` IS populated for character gun fire (verified live). `maxKills` is a stopping *floor*, not a mid-round cap: the Lua queue fights a round to target exhaustion and `combat-until` only re-checks between rounds, so 5 targets against `maxKills:4` legitimately yields 5 kills.
 - **Companion crafting doesn't count for research:** `c.entity.begin_crafting{...}` on a companion produces the item but does NOT register in `force.get_item_production_statistics()` - verified live, dozens of companion-crafted items all read 0 input count. Factorio 2.0 `craft-item` trigger technologies (e.g. `automation-science-pack` fires on crafting 1 lab) read that same statistic, so a companion can never satisfy one by crafting alone. Fix: either produce the item from a machine (furnace/assembler, which does register), or use `item_craft`'s `credited=true` mode, which runs `game.players[1].begin_crafting{...}` instead - this registers correctly, at the cost of spending the human player's inventory and crafting queue. **The trap is narrower than it looks, so check which kind of technology you have before reaching for `credited`:** it applies only to `craft-item` TRIGGER technologies. A unit-based tech (`research_unit_count` populated — `automation` is 10 units of 1 automation-science-pack) consumes packs from a lab and does not read production statistics at all, so plain companion crafting is fine (T-002, live).
 - **`item_craft`'s `count` is the number of CRAFTS, not of output items, and the queue debits ingredients up front while delivering products one craft at a time.** `count` goes straight to `begin_crafting{count = count}`, so `transport-belt` at `count = 2` yields **4** belts. More importantly the call returns immediately with `{crafted = N}` — that is the number *queued*, not produced. An inventory read taken right after shows the ingredients already gone and the products still missing, which reads exactly like items vanishing; 10 science packs took ~4 minutes of real time to land. Poll `LuaControl.crafting_queue_size` down to 0 before asserting on the result, and craft bottom-up in dependency order — the mod gates on `get_craftable_count(recipe) < count`, so queueing a recipe whose intermediates are still in the queue is refused with `{error = "Missing"}`.
-- **`research_set` APPENDS to the research queue — it does not preempt — and says `researching` either way.** `fac_research_set` calls `force.add_research(name)`, which puts the technology at the *end* of the queue, then replies `{researching = <name>}` unconditionally. With any research already in progress the named tech does not start: the incumbent keeps consuming science packs while the reply claims otherwise. This cost 8 of 10 hand-crafted packs to a 50-unit `steel-processing` in T-002 before `research_get` exposed it. Until **T-055** lands, always read `force.current_research` back over the side channel after calling it, and note the mod has **no** command to cancel or reorder the queue — `force.research_queue = {"<name>"}` over `/silent-command` is the only lever, and it is player-parity-legal because clicking a technology in the GUI does exactly that.
+- **The `on_nth_tick` queue handlers are pcall-protected as of 0.22.0, and the containment is
+  PER QUEUE ENTRY with forced removal — do not "simplify" it to one pcall around the handler.**
+  A per-handler pcall is *worse than no pcall*: `process_queue` collects into `to_remove` and
+  deletes only after the loop, and `tick_build_queues` debits the item **before**
+  `create_entity`, so a swallowed raise leaves the entry alive with the debit already spent and
+  `tick_start` unchanged — it re-debits **every 5 ticks until the inventory is empty**. An
+  unprotected raise at least fails loudly. Two further rules the fix encodes, both learned the
+  hard way: `to_remove` is appended to **before** the `on_error`/`on_drop` recorders run, and
+  each recorder is its **own** pcall — the first implementation ran `on_error` first and
+  unprotected, and since the recorders write exactly the state that just proved capable of
+  raising (`finish_harvest` writes `c.entity.mining_state`, `finish_build` reads
+  `q.position.x`), a raise inside one skipped the removal *and* the trailing deletion loop for
+  every other entry that tick, reinstating the drain loop inside the handler meant to prevent
+  it. Use `u.safe_tick(ctx, fn)` (pcall + `log_error`) for tick and event context, never
+  `u.safe_command` — that one answers with `rcon.print`, and with no request in flight during a
+  tick it emits an uncorrelated frame the TS client (which correlates by request id) cannot
+  match. Fault injection is **not reachable** through legitimate commands: `/silent-command`
+  cannot see mod storage and there is no debug command by decision, so containment can only be
+  re-verified with the temporary uncommitted patch documented in the header of
+  `scripts/smoke/t050-tick-fault.ts` — section 4 there is inert without `T050_FAULT_PATCH=1`
+  and contributes zero checks, so a green run of that file is **not** evidence it passed.
+- **`LuaCustomChartTag.position` IS writable in 2.0** — live-probed, assignment succeeded and
+  read back. `update_companion_markers` (`control.lua:169`) assigning it every 30 ticks is fine;
+  a code read flagged it as a read-only-property raise and was wrong.
+- **`force.research_queue` is readable AND assignable, and `force.current_research` is always
+  `research_queue[1]`** (head identity held on every probe). `force.add_research` **appends**;
+  it returns `false` when the technology is already queued (leaving the queue unchanged) or
+  already researched, and **raises** on an unknown name rather than returning false — so
+  `research.lua`'s `force.technologies[name]` guard is load-bearing, not defensive. Since
+  0.22.0 `research_set` reports `{researching, position = 1}` only when the technology genuinely
+  became current and `{queued, position, current}` — with no `researching` key — when it landed
+  behind an incumbent, both derived from the position read back *after* the call; an
+  already-queued technology reports `already_queued` rather than the old untrue
+  `{error = "Failed"}`. `research_get` now returns `queue` + `queue_count`. Appending is
+  deliberate and must not be "fixed" into preemption: it is correct on an empty queue and makes
+  repeated calls a usable queue-builder. There is still **no cancel or reorder command** —
+  `force.research_queue = {...}` over `/silent-command` is the only lever, and it is
+  player-parity-legal because clicking a technology in the GUI is exactly a queue reorder.
+  `research_get`'s `count` is still `#available` computed *after* truncation to 30, so it caps
+  at 30 and is not the count it claims to be.
+- **Original note, superseded by the above for 0.22.0+ —** **`research_set` APPENDS to the research queue — it does not preempt — and says `researching` either way.** `fac_research_set` calls `force.add_research(name)`, which puts the technology at the *end* of the queue, then replies `{researching = <name>}` unconditionally. With any research already in progress the named tech does not start: the incumbent keeps consuming science packs while the reply claims otherwise. This cost 8 of 10 hand-crafted packs to a 50-unit `steel-processing` in T-002 before `research_get` exposed it. Until **T-055** lands, always read `force.current_research` back over the side channel after calling it, and note the mod has **no** command to cancel or reorder the queue — `force.research_queue = {"<name>"}` over `/silent-command` is the only lever, and it is player-parity-legal because clicking a technology in the GUI does exactly that.
   **Narrowed 2026-07-29 (T-003): appending is CORRECT when the queue is empty, and repeated calls are a usable queue-builder — so do not "fix" this by making `research_set` always preempt.** With `current_research == nil` and an empty queue, six consecutive calls (`lamp`, `military`, `gun-turret`, `stone-wall`, `radar`, `repair-pack`) produced exactly that order, verified behaviourally rather than from the replies: `lamp` completed unaided, `military` became current, and `lamp` dropped out of `research_get`'s `available` list (8 → 7). Preempting unconditionally would destroy that ordering property and make a queue unbuildable through the tool. The defect is only the **reply** — all six answered `{researching: <name>}` while five were merely queued — so a `queued` vs `researching` distinction is the right fix and preemption, if wanted, belongs in a separate command. Related gap found the same day: **`research_get` returns `current` + `available` but NOT the queue**, so a multi-call sequence cannot be confirmed through the tool surface at all.
 - **`drop_target` is resolved when the entity is created and is NOT recomputed when a neighbour appears later — so place the consumer before the producer.** A burner drill placed *before* its stone furnace read `drop_target = "GROUND"` afterwards, and its drop position `(-74.703,-68.5)` sits 0.004 tiles outside the furnace's bounding box, which together look like decisive proof of a broken layout. Both signals are red herrings: the known-good pair 4 tiles away has the *same* 0.004 boundary quirk and reports correctly, and by TILE logic (`math.floor` of the drop position, not the float against the box) the drop lands squarely inside the furnace footprint. Fuelling both produced 4 plates within seconds and `drop_target` then read `stone-furnace`. This is the mechanism behind the design doc's long-standing "`drop_target` reported GROUND for a pair that was demonstrably feeding itself" warning. Build furnace-then-drill, and if you cannot, settle it by fuelling and watching the target's output rather than by re-reading the property.
 - **Never validate a fuel feeder against a hand-filled target — an inserter tops a burner's fuel slot only to ~5.** A chest + burner-inserter feeding the lake boiler was checked against a boiler hand-filled to 50, and correctly never fired: for 11 straight minutes the boiler drained 43 → 16, the chest sat unchanged at 299, and the inserter reported `waiting_for_space_in_destination` — indistinguishable from a mis-built feeder. The tell was that `boiler.can_insert{name="coal"}` returned **true** on the same tick the inserter claimed no space; the status is about the inserter's own top-up threshold, not the boiler's capacity. Draining the boiler to 5 made the chest decrement immediately. Fill the target to zero and let the feeder establish its own level. Same family as `can_place_entity` and `drop_target`: the engine property answered a narrower question than the one being asked.
