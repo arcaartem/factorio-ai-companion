@@ -92,21 +92,34 @@ async function main() {
     check("1a setup: inventory has zero empty stacks", fill1a.empty === 0, JSON.stringify(fill1a));
     check("1a setup: exactly 95 iron-plate present (5 short of a full stack)", fill1a.iron === 95, JSON.stringify(fill1a));
 
-    console.log("\n=== 1a setup: scan for pre-existing containers near the companion ===");
+    // Scan with building_empty's OWN predicate, not a narrower one. Filtering to
+    // type={"container","logistic-container"} reported count 0 while an assembling-machine sat
+    // nearer the companion than the chest - an assembler has an output inventory, so it satisfies
+    // `empty` and u.resolve_target legitimately preferred it as the nearest match (T-056). A
+    // pre-scan narrower than the thing it is warning about produces false confidence, not safety.
+    console.log("\n=== 1a setup: scan for pre-existing qualifying targets near the companion ===");
     const scanRaw = await silent(
       rcon,
       `
         local __player = game.players[1]
-        local nearby = __player.surface.find_entities_filtered{position = {x=${px}, y=${py}}, radius = 6, type = {"container", "logistic-container"}}
-        rcon.print(helpers.table_to_json({count = #nearby}))
+        local out = {}
+        for _, e in ipairs(__player.surface.find_entities_filtered{position = {x=${px}, y=${py}}, radius = 6}) do
+          if e.valid and e.type ~= "character"
+             and (e.get_inventory(defines.inventory.chest) ~= nil
+               or e.get_inventory(defines.inventory.furnace_result) ~= nil
+               or e.get_inventory(defines.inventory.assembling_machine_output) ~= nil) then
+            out[#out+1] = {name = e.name, x = e.position.x, y = e.position.y}
+          end
+        end
+        rcon.print(helpers.table_to_json({count = #out, entities = out}))
       `
     );
     const scan = JSON.parse(scanRaw);
-    console.log("Container scan ->", JSON.stringify(scan));
+    console.log("Qualifying-target scan ->", JSON.stringify(scan));
     if (scan.count > 0) {
       console.log(
-        `WARNING: ${scan.count} container(s) already within radius 6 of the companion. ` +
-          `building_empty scans radius 3 from the companion and could pick one of these instead, which would corrupt the extracted count.`
+        `NOTE: ${scan.count} entity/entities within radius 6 already satisfy building_empty's own predicate. ` +
+          `Section 1a targets its chest explicitly (x/y + entityName), so these cannot be picked instead.`
       );
     }
 
@@ -142,7 +155,17 @@ async function main() {
     );
 
     console.log("\n=== 1a: building_empty(iron-plate, count=50) ===");
-    const emptyRes = await callTool(mcp.client, "building_empty", { companionId: 1, itemName: "iron-plate", count: 50 });
+    // Target the chest by the position it ACTUALLY landed on plus its name. Omitting x/y left the
+    // subject to nearest-entity resolution, which is not what this section is testing - the guard
+    // here is partial-accept not destroying the shortfall, so the subject must be pinned.
+    const emptyRes = await callTool(mcp.client, "building_empty", {
+      companionId: 1,
+      itemName: "iron-plate",
+      count: 50,
+      x: place.x,
+      y: place.y,
+      entityName: "wooden-chest",
+    });
     console.log("building_empty response ->", JSON.stringify(emptyRes));
     check("1a: response.full === true", emptyRes.full === true, JSON.stringify(emptyRes));
     check("1a: response.extracted === 5", emptyRes.extracted === 5, JSON.stringify(emptyRes));
